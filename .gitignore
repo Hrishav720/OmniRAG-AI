@@ -1,0 +1,11 @@
+__pycache__
+.env
+menv
+req.txt
+menv/
+myenv/
+venv/
+__pycache__/
+*.pyc
+.env
+.ipynb_checkpoints/
