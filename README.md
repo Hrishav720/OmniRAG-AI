@@ -1,13 +1,13 @@
-# 🔍 DocMind — Agentic RAG Explorer
+# 🚀 OmniRAG — Agentic RAG Explorer
 
 <div align="center">
 
-### 🧠 Intelligent Document Question Answering with Agentic RAG
+### 🧠 Intelligent Multi-Format Document Question Answering with Agentic RAG
 
 **Upload → Retrieve → Grade → Generate → Critique → Evaluate**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge\&logo=python\&logoColor=white)](https://www.python.org/)
-[![LangChain](https://img.shields.io/badge/LangChain-Framework-1C3C3C?style=for-the-badge\&logo=chainlink\&logoColor=white)](https://www.langchain.com/)
+[![LangChain](https://img.shields.io/badge/LangChain-Framework-1C3C3C?style=for-the-badge)](https://www.langchain.com/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-Agentic%20Workflow-FF6B35?style=for-the-badge)](https://www.langchain.com/langgraph)
 [![FAISS](https://img.shields.io/badge/FAISS-Vector%20Search-0467DF?style=for-the-badge)](https://github.com/facebookresearch/faiss)
 [![Streamlit](https://img.shields.io/badge/Streamlit-UI-FF4B4B?style=for-the-badge\&logo=streamlit\&logoColor=white)](https://streamlit.io/)
@@ -19,67 +19,49 @@
 
 ## 🌟 Overview
 
-**DocMind** is an **agentic Retrieval-Augmented Generation (RAG) system** designed to answer questions from user-uploaded documents while reducing irrelevant retrieval and unsupported answers.
+**OmniRAG** is an **agentic Retrieval-Augmented Generation (RAG) system** designed to answer questions from multiple types of user-uploaded documents.
 
-Instead of simply retrieving documents and asking an LLM to generate an answer, DocMind introduces multiple validation stages:
+Unlike a basic RAG pipeline that simply retrieves documents and generates an answer, OmniRAG introduces multiple validation and self-correction stages to improve retrieval quality and reduce unsupported answers.
 
-* 📂 Automatic file-type detection
-* 📄 PDF, CSV and image ingestion
-* 🔎 Scanned-PDF detection
-* 🖼️ OCR using PaddleOCR
-* ✂️ Recursive document chunking
+### ✨ What makes OmniRAG different?
+
+* 📄 Multi-format document ingestion
+* 🔍 Automatic file-type detection
+* 🖼️ OCR support for images and scanned PDFs
+* ✂️ Intelligent document chunking
 * 🧬 Hugging Face embeddings
-* 🗂️ FAISS vector search
-* 🎯 Retrieval relevance grading
+* ⚡ FAISS vector search
+* 🎯 MMR-based retrieval
+* 🧑‍⚖️ LLM relevance grading
 * 📊 Context sufficiency checking
-* 🤖 LLM answer generation
+* 🤖 Context-grounded answer generation
 * 🧐 Critic-based hallucination detection
 * 🔄 Automatic retry mechanism
+* 🚫 Answer-not-found protection
 * 📈 Four answer-quality evaluation metrics
+* 🎨 Interactive Streamlit interface
 
-The Streamlit frontend provides a clean interface for uploading documents, asking questions and viewing retrieval/critic statistics and evaluation scores.
-
----
-
-# 🚀 Key Features
-
-| Feature                          | Description                                                        |
-| -------------------------------- | ------------------------------------------------------------------ |
-| 📄 **Multi-format ingestion**    | Supports PDF, CSV and image files                                  |
-| 🧾 **Scanned PDF support**       | Detects scanned PDFs and extracts text with OCR                    |
-| 👁️ **Image OCR**                | Extracts text from PNG/JPG/JPEG/BMP images                         |
-| ✂️ **Smart Chunking**            | Recursive character splitting with overlap                         |
-| 🧬 **Embeddings**                | `BAAI/bge-small-en-v1.5`                                           |
-| ⚡ **FAISS Retrieval**            | Fast vector similarity search                                      |
-| 🎯 **MMR Retrieval**             | Uses Maximum Marginal Relevance retrieval                          |
-| 🧑‍⚖️ **Relevance Grader**       | Filters irrelevant retrieved chunks                                |
-| 📊 **Context Sufficiency Agent** | Checks whether retrieved context is enough                         |
-| 🤖 **Answer Generator**          | Generates answers strictly from retrieved context                  |
-| 🧐 **Critic Agent**              | Checks for hallucination and answer relevance                      |
-| 🔄 **Retry Mechanism**           | Re-runs retrieval/critique when necessary                          |
-| 🚫 **Answer Not Found**          | Avoids returning unsupported answers after failed validation       |
-| 📈 **Evaluation**                | Faithfulness, Answer Relevancy, Context Precision & Context Recall |
-| 🎨 **Streamlit UI**              | Interactive document Q&A interface                                 |
+OmniRAG currently supports **PDF, CSV and image inputs** through its Streamlit interface.
 
 ---
 
-# 🏗️ System Architecture
+# 🏗️ Architecture
 
 ```mermaid
 flowchart TD
 
     A[👤 User] --> B[📤 Upload Document]
 
-    B --> C{📁 File Type?}
+    B --> C{📁 File Type}
 
     C -->|CSV| D[📊 CSV Loader]
-    C -->|PDF| E{📄 PDF Type?}
-    C -->|Image| F[🖼️ Image Loader + PaddleOCR]
+    C -->|PDF| E{📄 PDF Classification}
+    C -->|Image| F[🖼️ Image OCR]
 
     E -->|Text PDF| G[📄 PyPDF Loader]
     E -->|Scanned PDF| H[🔍 PDF → Images → PaddleOCR]
 
-    D --> I[✂️ Chunking]
+    D --> I[✂️ Document Chunking]
     G --> I
     H --> I
     F --> I
@@ -90,28 +72,29 @@ flowchart TD
     K --> L[🔎 MMR Retrieval]
 
     L --> M[🎯 Relevance Grader]
-    M --> N[📚 Filter Relevant Chunks]
+    M --> N[📚 Relevant Chunks]
 
     N --> O{📊 Context Sufficient?}
 
-    O -->|No| P[🔄 Increase Retrieval Attempts]
+    O -->|❌ No| P[🔄 Increase Retrieval Attempts]
     P --> L
 
-    O -->|Yes| Q[🤖 Answer Generation]
+    O -->|✅ Yes| Q[🤖 Answer Generation]
 
     Q --> R[🧐 Critic Agent]
 
-    R -->|PASS| S[📈 Evaluation]
-    R -->|FAIL| T{🔄 Retry Limit?}
+    R -->|✅ PASS| S[📈 Evaluation]
+
+    R -->|❌ FAIL| T{🔄 Retry Limit?}
 
     T -->|No| P
     T -->|Yes| U[❌ Answer Not Found]
 
-    S --> V[✅ Final Response]
+    S --> V[✅ Final Answer]
 
-    style A fill:#4F46E5,color:#fff
+    style A fill:#6366F1,color:#fff
     style B fill:#0EA5E9,color:#fff
-    style K fill:#7C3AED,color:#fff
+    style K fill:#8B5CF6,color:#fff
     style M fill:#F59E0B,color:#fff
     style O fill:#F97316,color:#fff
     style Q fill:#10B981,color:#fff
@@ -123,60 +106,140 @@ flowchart TD
 
 ---
 
-# 🧠 RAG Pipeline
-
-## 1️⃣ File Detection
-
-DocMind first determines whether the uploaded file is:
+# 🔄 OmniRAG Pipeline
 
 ```text
-CSV
+                    ┌──────────────────┐
+                    │   👤 User        │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                    ┌──────────────────┐
+                    │ 📤 Upload File   │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                    ┌──────────────────┐
+                    │ 📁 File Detection│
+                    └────────┬─────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+           📊 CSV       📄 PDF          🖼️ Image
+              │              │              │
+              │       ┌──────┴──────┐       │
+              │       ▼             ▼       │
+              │    Text PDF     Scanned PDF │
+              │       │             │       │
+              │       │          🔍 OCR      │
+              │       │             │       │
+              └───────┴──────┬──────┴───────┘
+                              ▼
+                       ✂️ Chunking
+                              │
+                              ▼
+                     🧬 Embeddings
+                              │
+                              ▼
+                      🗂️ FAISS Store
+                              │
+                              ▼
+                       🔎 MMR Retrieval
+                              │
+                              ▼
+                     🎯 Relevance Grader
+                              │
+                              ▼
+                  📚 Filter Relevant Chunks
+                              │
+                              ▼
+                  📊 Context Sufficiency
+                         │          │
+                    ❌ No│          │Yes
+                         ▼          ▼
+                   🔄 Retry    🤖 Generate
+                         │          │
+                         └─────┐    ▼
+                               │ 🧐 Critic
+                               │    │
+                               │ ┌──┴──┐
+                               │ ▼     ▼
+                               │PASS  FAIL
+                               │ │     │
+                               │ ▼     ▼
+                               │ Eval  Retry
+                               │ │
+                               ▼ ▼
+                         📈 Evaluation
+                              │
+                              ▼
+                         ✅ Answer
+```
+
+---
+
+# 🧩 Core Components
+
+## 📂 1. Multi-Format Ingestion
+
+OmniRAG accepts:
+
+```text
+📄 PDF
+📊 CSV
+🖼️ PNG
+🖼️ JPG
+🖼️ JPEG
+🖼️ BMP
+```
+
+The frontend explicitly configures these supported file types.
+
+The backend automatically routes files based on their extension.
+
+---
+
+# 📄 2. Intelligent PDF Processing
+
+OmniRAG distinguishes between:
+
+### 📄 Text PDF
+
+Uses:
+
+```python
+PyPDFLoader
+```
+
+### 🖼️ Scanned PDF
+
+Uses:
+
+```text
 PDF
-Image
+ ↓
+PDF → Images
+ ↓
+PaddleOCR
+ ↓
+Extracted Text
 ```
 
-The workflow then routes the file to the appropriate loader.
+The system checks the extracted text from the first few pages to determine whether the PDF is text-based or scanned.
 
 ---
 
-## 2️⃣ PDF Classification
+# 🔍 3. OCR
 
-PDF files are checked to determine whether they contain extractable text.
-
-```text
-                 PDF
-                  │
-                  ▼
-        ┌───────────────────┐
-        │ PDF Classification│
-        └─────────┬─────────┘
-                  │
-          ┌───────┴───────┐
-          ▼               ▼
-     Text PDF        Scanned PDF
-          │               │
-     PyPDFLoader      PaddleOCR
-          │               │
-          └───────┬───────┘
-                  ▼
-               Chunks
-```
-
-The system examines the first pages and classifies the PDF as either **text** or **scanned**.
-
----
-
-# 🔍 OCR Pipeline
-
-Scanned PDFs are converted into images and processed using **PaddleOCR**.
+For scanned documents and images, OmniRAG uses **PaddleOCR**.
 
 ```mermaid
 flowchart LR
 
-    A[📄 Scanned PDF]
-    --> B[🖼️ Convert PDF to Images]
+    A[📄 Scanned Document]
+    --> B[🖼️ Convert to Images]
     --> C[🔍 PaddleOCR]
-    --> D[📝 Extracted Text]
+    --> D[📝 Extract Text]
     --> E[✂️ Chunking]
     --> F[🧬 Embeddings]
     --> G[(FAISS)]
@@ -186,124 +249,129 @@ flowchart LR
     style G fill:#2563EB,color:#fff
 ```
 
-The same OCR approach is also used for uploaded images.
+The OCR pipeline processes extracted text into LangChain `Document` objects for downstream RAG processing.
 
 ---
 
-# ✂️ Document Chunking
+# ✂️ 4. Intelligent Chunking
 
-Documents are split using `RecursiveCharacterTextSplitter`.
+OmniRAG uses:
+
+```python
+RecursiveCharacterTextSplitter
+```
 
 ### Configuration
 
-```text
-Chunk Size      : 800
-Chunk Overlap   : 150
-```
+| Parameter     | Value |
+| ------------- | ----: |
+| Chunk Size    | `800` |
+| Chunk Overlap | `150` |
 
-The splitter uses paragraph, line, sentence and whitespace boundaries to create chunks.
+The splitter uses paragraph, line, sentence and whitespace separators.
 
 ---
 
-# 🧬 Embedding & Vector Search
+# 🧬 5. Embedding Model
 
-DocMind uses:
+OmniRAG uses the Hugging Face embedding model:
 
 ```text
-Embedding Model
 BAAI/bge-small-en-v1.5
 ```
 
-Chunks are converted into embeddings and stored in:
-
-```text
-FAISS Vector Store
-```
+The embeddings are generated from document chunks before storing them in the vector database.
 
 ---
 
-# 🎯 Intelligent Retrieval
+# ⚡ 6. FAISS Vector Database
 
-The retriever uses **MMR (Maximum Marginal Relevance)** rather than basic similarity search.
-
-The number of retrieved chunks can increase when the pipeline needs additional retrieval attempts, up to a maximum of 20 chunks.
+The project uses **FAISS** for vector storage and similarity retrieval.
 
 ```text
-Question
-   │
-   ▼
+Documents
+    ↓
+Chunks
+    ↓
+Embeddings
+    ↓
 FAISS
-   │
-   ▼
-MMR Retrieval
-   │
-   ▼
-Retrieved Chunks
-   │
-   ▼
-Relevance Grader
-   │
-   ├── ❌ Irrelevant → Remove
-   │
-   └── ✅ Relevant → Keep
+    ↓
+Relevant Documents
 ```
 
 ---
 
-# 🧑‍⚖️ Relevance Grading
+# 🎯 7. MMR Retrieval
 
-Each retrieved document is evaluated by an LLM-based relevance grader.
+OmniRAG uses **Maximum Marginal Relevance (MMR)** retrieval.
 
-The grader returns:
+This allows the system to retrieve relevant information while reducing redundant chunks.
+
+The retrieval depth dynamically increases based on previous retrieval and critic attempts, up to a maximum of 20 documents.
+
+---
+
+# 🧑‍⚖️ 8. Relevance Grading
+
+Retrieved documents are passed through an LLM-based relevance grader.
 
 ```text
-yes → Relevant
-no  → Irrelevant
+Retrieved Document
+        │
+        ▼
+   🎯 Grader Agent
+        │
+    ┌───┴───┐
+    ▼       ▼
+   YES      NO
+    │       │
+    ▼       ▼
+  Keep    Remove
 ```
 
-Only relevant chunks continue through the pipeline.
+The grader returns `yes` or `no`, and only relevant chunks continue through the pipeline.
 
 ---
 
-# 📊 Context Sufficiency Check
+# 📊 9. Context Sufficiency Agent
 
-After filtering retrieved chunks, another evaluation stage checks whether the available context is sufficient.
+Before generating an answer, OmniRAG checks whether the retrieved context contains enough information.
 
-It considers:
+It evaluates:
 
-* **Completeness**
-* **Coverage**
-* **Missing information**
+* Completeness
+* Coverage
+* Missing information
 
-If the context is insufficient, the system increases retrieval attempts and searches again.
+If the context is insufficient, retrieval is retried with an increased retrieval depth.
 
 ---
 
-# 🤖 Answer Generation
+# 🤖 10. Grounded Answer Generation
 
-The answer-generation agent is instructed to use **only the retrieved context**.
-
-Its core rules are:
+The answer-generation agent is explicitly instructed to:
 
 ```text
-✓ Use only information from the context
-✓ Do not make up facts
-✓ Admit when information is insufficient
-✓ Be concise and accurate
+✓ Use only retrieved context
+✓ Avoid unsupported facts
+✓ Avoid hallucination
+✓ Clearly state when information is insufficient
+✓ Produce concise answers
 ```
 
 ---
 
-# 🧐 Critic Agent
+# 🧐 11. Critic Agent
 
-Before accepting an answer, DocMind sends it to a **critic agent**.
+OmniRAG uses a separate critic stage to validate the generated answer.
 
-The critic evaluates:
+The critic checks:
 
 ```text
 Question
    +
-Retrieved Context
+Context
    +
 Generated Answer
         │
@@ -318,91 +386,89 @@ Generated Answer
 Evaluation  Retry
 ```
 
-Possible failure reasons include:
+The critic can identify:
 
+* `sufficient_context`
+* `insufficient_context`
 * `hallucination`
 * `irrelevant_answer`
-* `insufficient_context`
 
 ---
 
-# 🔄 Self-Correction / Retry
+# 🔄 12. Self-Correction
 
-If the critic rejects an answer, the pipeline can retry.
+If the critic rejects an answer, OmniRAG can retry the pipeline.
 
-The system tracks:
+The system maintains separate counters for:
 
 ```text
 retrieval_attempts
 critic_attempts
 ```
 
-After the critic reaches the retry limit, the system returns:
-
-> **Answer not found in the uploaded documents.**
-
-This prevents the system from endlessly generating unsupported answers.
-
----
-
-# 📈 Answer Evaluation
-
-The project evaluates the final answer using four metrics:
-
-| Metric                   | Purpose                                                    |
-| ------------------------ | ---------------------------------------------------------- |
-| 🟢 **Faithfulness**      | Measures whether the answer is supported by the context    |
-| 🔵 **Answer Relevancy**  | Measures whether the answer addresses the question         |
-| 🟣 **Context Precision** | Measures whether retrieved context is focused              |
-| 🟠 **Context Recall**    | Measures whether the context contains required information |
-
-Each metric is represented as a score between **0.0 and 1.0**.
-
----
-
-# 🎨 Streamlit Interface
-
-DocMind includes a custom dark-themed Streamlit interface.
-
-### UI includes:
-
-* 📤 Document uploader
-* 💬 Question input
-* ⚡ Ask button
-* 📊 Retrieval statistics
-* 🧐 Critic verdict
-* 📝 Critic reason
-* 💡 Generated answer
-* 📈 Evaluation score cards
-* ✅ Verified / ❌ Unverified / ⚠️ Not Found status
-
-The frontend supports:
+If the critic continues to fail after the configured retry limit, the system returns:
 
 ```text
-PDF
-CSV
-PNG
-JPG
-JPEG
-BMP
+❌ Answer not found in the uploaded documents.
 ```
 
 ---
 
+# 📈 13. Evaluation
+
+OmniRAG evaluates the final response using four metrics:
+
+| Metric                   | What it measures                               |
+| ------------------------ | ---------------------------------------------- |
+| 🟢 **Faithfulness**      | Whether the answer is supported by context     |
+| 🔵 **Answer Relevancy**  | Whether the answer addresses the question      |
+| 🟣 **Context Precision** | Whether retrieved context is focused           |
+| 🟠 **Context Recall**    | Whether required information exists in context |
+
+Each score ranges from `0.0` to `1.0`.
+
+---
+
+# 🎨 User Interface
+
+The Streamlit frontend provides:
+
+### 📤 Input
+
+* Document uploader
+* Question input
+* Ask button
+
+### 📊 Pipeline Statistics
+
+* Retrieval attempts
+* Critic attempts
+* Critic verdict
+* Critic reason
+
+### 💡 Output
+
+* Generated answer
+* Verification status
+* Evaluation metrics
+* Score visualization
+
+## The interface uses a custom dark theme with separate cards for answers, scores and pipeline statistics.
+
 # 🛠️ Tech Stack
 
-### 🧠 AI / LLM
+### 🧠 LLM & AI
 
 * OpenAI GPT-4o-mini
 * LangChain
 * LangGraph
-* Structured LLM outputs
+* Pydantic
 
 ### 🔎 Retrieval
 
 * FAISS
 * Hugging Face Embeddings
-* `BAAI/bge-small-en-v1.5`
+* BAAI/BGE
 * MMR Retrieval
 
 ### 📄 Document Processing
@@ -417,39 +483,32 @@ BMP
 ### 🎨 Frontend
 
 * Streamlit
-* Custom HTML/CSS
-* Responsive dashboard layout
+* HTML
+* CSS
 
-### 🐍 Programming
+### 🐍 Development
 
 * Python
-* TypedDict
-* Pydantic
-
-The core graph is constructed using LangGraph `StateGraph` and compiled into the final executable graph.
+* Git
+* GitHub
 
 ---
 
 # 📁 Project Structure
 
 ```text
-DocMind/
+OmniRAG/
 │
-├── frontend.py          # 🎨 Streamlit user interface
+├── frontend.py          # 🎨 Streamlit interface
 ├── main.py              # 🧠 LangGraph RAG pipeline
-├── requirements.txt     # 📦 Python dependencies
-├── .env                 # 🔐 API credentials
+├── requirements.txt     # 📦 Dependencies
+├── .env                 # 🔐 API keys
 ├── README.md            # 📖 Documentation
-└── assets/              # 🖼️ Optional project assets
+│
+└── assets/              # 🖼️ Optional assets
 ```
 
-> Rename `main(3).py` to `main.py` if you want to use the current frontend import exactly as written.
-
-The frontend imports the compiled graph using:
-
-```python
-from main import graph
-```
+The frontend imports the compiled LangGraph workflow from `main.py`.
 
 ---
 
@@ -458,9 +517,9 @@ from main import graph
 ## 1. Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/DocMind.git
+git clone https://github.com/YOUR_USERNAME/OmniRAG.git
 
-cd DocMind
+cd OmniRAG
 ```
 
 ## 2. Create a virtual environment
@@ -469,7 +528,6 @@ cd DocMind
 
 ```bash
 python -m venv venv
-
 venv\Scripts\activate
 ```
 
@@ -477,11 +535,8 @@ venv\Scripts\activate
 
 ```bash
 python3 -m venv venv
-
 source venv/bin/activate
 ```
-
----
 
 ## 3. Install dependencies
 
@@ -499,192 +554,117 @@ Create a `.env` file:
 OPENAI_API_KEY=your_openai_api_key
 ```
 
-The project loads environment variables using `python-dotenv` and initializes `GPT-4o-mini` with temperature `0`.
+The application loads environment variables using `python-dotenv` and initializes GPT-4o-mini with temperature `0`.
 
 ---
 
-# ▶️ Run the Application
-
-Start the Streamlit frontend:
+# ▶️ Run OmniRAG
 
 ```bash
 streamlit run frontend.py
 ```
 
-Then open the local Streamlit URL displayed in your terminal.
+Then open the Streamlit URL shown in your terminal.
 
 ---
 
-# 💡 Example Workflow
+# 🧪 Example
+
+### Upload
 
 ```text
-1. Upload a PDF / CSV / Image
-             ↓
-2. Ask a question
-             ↓
-3. DocMind detects file type
-             ↓
-4. Extracts document text
-             ↓
-5. Creates chunks
-             ↓
-6. Generates embeddings
-             ↓
-7. Stores vectors in FAISS
-             ↓
-8. Retrieves relevant chunks
-             ↓
-9. Grades retrieved chunks
-             ↓
-10. Checks context sufficiency
-             ↓
-11. Generates answer
-             ↓
-12. Critic checks answer
-             ↓
-13. Retry if necessary
-             ↓
-14. Evaluate answer
-             ↓
-15. Return verified response
+📄 research_paper.pdf
+```
+
+### Ask
+
+```text
+"What are the main conclusions of this research paper?"
+```
+
+### OmniRAG
+
+```text
+📄 Load
+   ↓
+✂️ Chunk
+   ↓
+🧬 Embed
+   ↓
+🗂️ FAISS
+   ↓
+🔎 Retrieve
+   ↓
+🎯 Grade
+   ↓
+📊 Check Sufficiency
+   ↓
+🤖 Generate
+   ↓
+🧐 Critic
+   ↓
+📈 Evaluate
+   ↓
+✅ Answer
 ```
 
 ---
 
-# 🧠 Why Agentic RAG?
+# 🧠 Traditional RAG vs OmniRAG
 
-Traditional RAG:
+| Traditional RAG | 🚀 OmniRAG           |
+| --------------- | -------------------- |
+| Retrieve        | Retrieve             |
+| Generate        | Grade                |
+| Answer          | Check context        |
+| —               | Generate             |
+| —               | Critic               |
+| —               | Retry                |
+| —               | Evaluate             |
+| —               | Verified / Not Found |
 
-```text
-Question
-   ↓
-Retrieve
-   ↓
-Generate
-   ↓
-Answer
-```
+### OmniRAG focuses on:
 
-DocMind:
-
-```text
-Question
-   ↓
-Retrieve
-   ↓
-Grade
-   ↓
-Check Sufficiency
-   ↓
-Generate
-   ↓
-Critic
-   ↓
-Retry if Needed
-   ↓
-Evaluate
-   ↓
-Answer
-```
-
-The additional validation stages are designed to improve retrieval quality and reduce unsupported answers.
-
----
-
-# 🚧 Current Limitations
-
-* FAISS vector stores are created during the current pipeline execution rather than being persisted as a reusable index.
-* Scanned-PDF OCR currently depends on a local Poppler installation.
-* The scanned-PDF loader contains a machine-specific Poppler path that should be configured before running on another system.
-* The evaluation stage generates four metric scores through an LLM evaluation chain rather than calling the RAGAS Python metrics directly.
-* API access is required for the configured OpenAI model.
+**Retrieval Quality → Context Quality → Answer Quality → Answer Verification**
 
 ---
 
 # 🔮 Future Improvements
 
-### 🔥 Planned / Possible Enhancements
-
-* [ ] Persistent FAISS index
-* [ ] Incremental document ingestion
-* [ ] Multi-document knowledge base
+* [ ] Persistent FAISS indexes
+* [ ] Multi-document knowledge bases
 * [ ] Conversation memory
+* [ ] Source citations
 * [ ] Streaming responses
-* [ ] Source/citation display
-* [ ] Better OCR preprocessing
-* [ ] Configurable retrieval parameters
-* [ ] Configurable retry limits
-* [ ] Real RAGAS metric integration
 * [ ] LangSmith observability
 * [ ] Docker deployment
 * [ ] Cloud deployment
 * [ ] Authentication
 * [ ] User-specific document collections
-
----
-
-# 📊 LangGraph Workflow
-
-The complete graph contains dedicated nodes for:
-
-```text
-filetype_node
-        ↓
-route_file_type
-        ↓
-CSV / PDF / Image
-        ↓
-PDF Classification
-        ↓
-Document Loader
-        ↓
-chunking_node
-        ↓
-vectorstore_node
-        ↓
-retrieval_node
-        ↓
-filter_chunks_node
-        ↓
-check_context_sufficiency_node
-        ↓
-generation_node
-        ↓
-critic_node
-        ↓
-ragas_evaluation_node
-        ↓
-END
-```
-
-Retry branches are also connected between retrieval, sufficiency checking and critic validation.
+* [ ] Improved OCR preprocessing
+* [ ] Configurable retrieval parameters
+* [ ] Native RAGAS metric integration
 
 ---
 
 # 👨‍💻 Author
 
-**Hrishav Raj**
+## Hrishav Raj
 
-B.Tech — Artificial Intelligence / Machine Learning Enthusiast
+**B.Tech | AI / ML & Generative AI Enthusiast**
 
 ### Interests
 
-`AI` · `Machine Learning` · `Generative AI` · `LLMs` · `RAG` · `LangChain` · `LangGraph` · `Agentic AI`
-
----
-
-# ⭐ Support
-
-If you find this project useful, consider giving it a ⭐ on GitHub!
+`AI` · `Machine Learning` · `Generative AI` · `LLMs` · `RAG` · `Agentic AI` · `LangChain` · `LangGraph`
 
 ---
 
 <div align="center">
 
-### 🔍 DocMind
+## ⭐ OmniRAG
 
-**Retrieve intelligently. Validate rigorously. Answer reliably.**
+### **Retrieve intelligently. Critique rigorously. Answer reliably.**
 
-Made with ❤️ using Python, LangChain, LangGraph, FAISS, OpenAI & Streamlit.
+Built with ❤️ using **Python · LangChain · LangGraph · FAISS · OpenAI · Streamlit**
 
 </div>
