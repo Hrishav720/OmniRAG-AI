@@ -1,214 +1,576 @@
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
-from langchain_huggingface import ChatHuggingFace
-from pydantic import BaseModel,Field
-from langchain_openai import ChatOpenAI
-from typing import TypedDict, List
+from pydantic import BaseModel, Field
+from typing import TypedDict, List, Optional
 import os
-from langchain_community.document_loaders import (
-    PyPDFLoader,
-    TextLoader,
-    CSVLoader
-)
+import re
+import json
+from langchain_openai import ChatOpenAI
+import threading
+from collections import OrderedDict
+import hashlib
+from langchain_community.document_loaders import CSVLoader
+from docling.document_converter import DocumentConverter
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.prebuilt import ToolNode
+from langgraph.config import get_stream_writer
 from langchain_core.documents import Document
-
-from pdf2image import convert_from_path
-from PIL import Image
 from langchain_huggingface import HuggingFaceEmbeddings
+from rank_bm25 import BM25Okapi
+from sentence_transformers import CrossEncoder
 
-
-
-# LLM
+# ── LLM & Embeddings ──────────────────────────────────────────────────────────
 
 load_dotenv()
 
+def _to_text(content) -> str:
+    
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and part.get("type", "text") == "text":
+                parts.append(part.get("text", ""))
+        return "".join(parts)
+    return str(content or "")
+
+
+
+
 llm = ChatOpenAI(
     model="gpt-4o-mini",
-    temperature=0
+    temperature=0,
+    api_key=os.getenv("OPENAI_API_KEY")
 )
+
+
 
 embeddings = HuggingFaceEmbeddings(
     model_name="BAAI/bge-small-en-v1.5"
 )
 
-# Data Loading
 
-uploaded_data=""
+RERANKER_MODEL = os.getenv("OMNIRAG_RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+reranker = CrossEncoder(RERANKER_MODEL)
+
+MAX_RETRIEVAL_ATTEMPTS = 2
+MAX_CRITIC_ATTEMPTS = 2
+
+GRADER_MAX_CONCURRENCY = 8
+
+GRAPH_RECURSION_LIMIT = 60
+
+# ── Hybrid retrieval + reranking tunables ─────────────────────────────────────
+VECTOR_CANDIDATES = int(os.getenv("OMNIRAG_VECTOR_CANDIDATES", "30"))   
+LEXICAL_CANDIDATES = int(os.getenv("OMNIRAG_LEXICAL_CANDIDATES", "30"))  
+RRF_K = int(os.getenv("OMNIRAG_RRF_K", "60"))                            
+RERANK_TOP_N = int(os.getenv("OMNIRAG_RERANK_TOP_N", "8"))               
+
+# ── Data directories ──────────────────────────────────────────────
+DATA_DIR = os.getenv(
+    "OMNIRAG_DATA_DIR",
+    os.path.dirname(os.path.abspath(__file__))
+)
+
+CACHE_DIR = os.path.join(DATA_DIR, "vectorstore_cache")
+COLLECTIONS_DIR = os.path.join(DATA_DIR, "knowledge_base_collections")
+
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(COLLECTIONS_DIR, exist_ok=True)
+
+_COLLECTIONS_LOCK = threading.Lock()
+_COLLECTION_LOCKS: dict[str, threading.RLock] = {}
+
+def _validate_collection_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name or len(name) > 64 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.-]*", name):
+        raise ValueError("Collection name must be 1-64 characters and use only letters, numbers, spaces, dots, underscores, or hyphens; it must start with a letter or number.")
+    return name
+
+
+def _collection_id(name: str) -> str:
+    return hashlib.sha256(_validate_collection_name(name).casefold().encode("utf-8")).hexdigest()[:32]
+
+
+def _collection_path(name: str) -> str:
+    return os.path.join(COLLECTIONS_DIR, _collection_id(name))
+
+
+def _collection_lock(name: str):
+    key = _collection_id(name)
+    with _COLLECTIONS_LOCK:
+        return _COLLECTION_LOCKS.setdefault(key, threading.RLock())
+
+
+def ensure_knowledge_collection(name: str) -> dict:
+    """Create a collection manifest without altering the retrieval architecture."""
+    name = _validate_collection_name(name)
+    path = _collection_path(name)
+    os.makedirs(path, exist_ok=True)
+    manifest_path = os.path.join(path, "collection.json")
+    with _collection_lock(name):
+        if os.path.exists(manifest_path):
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        else:
+            manifest = {"name": name, "files": [], "version": 1}
+            _write_collection_manifest(manifest_path, manifest)
+    return {"name": manifest.get("name", name), "file_count": len(manifest.get("files", [])), "path": path}
+
+
+def _write_collection_manifest(path: str, manifest: dict) -> None:
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
+
+
+def list_knowledge_collections() -> list[dict]:
+    """Return persisted collection names and basic inventory metadata."""
+    result = []
+    try:
+        entries = os.listdir(COLLECTIONS_DIR)
+    except OSError:
+        return result
+    for entry in entries:
+        manifest_path = os.path.join(COLLECTIONS_DIR, entry, "collection.json")
+        if not os.path.isfile(manifest_path):
+            continue
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            result.append({
+                "name": manifest.get("name", entry),
+                "file_count": len(manifest.get("files", [])),
+                "has_index": os.path.isfile(os.path.join(COLLECTIONS_DIR, entry, "index.faiss")),
+            })
+        except (OSError, ValueError, TypeError):
+            continue
+    return sorted(result, key=lambda item: item["name"].casefold())
+
+
+def get_collection_vectorstore(name: str):
+    """Load a named collection's persistent FAISS index, using the existing LRU."""
+    name = _validate_collection_name(name)
+    path = _collection_path(name)
+    if not os.path.isfile(os.path.join(path, "index.faiss")):
+        raise ValueError(f"Collection '{name}' has no indexed documents yet. Upload at least one file first.")
+    cache_key = "collection:" + _collection_id(name)
+    vectorstore = _recall_vectorstore(cache_key)
+    if vectorstore is None:
+        vectorstore = FAISS.load_local(
+            path, embeddings, allow_dangerous_deserialization=True
+        )
+        _remember_vectorstore(cache_key, vectorstore)
+    return vectorstore
+
+# In-memory layer on top of the on-disk FAISS cache: a repeat question about the
+# same files skips even the disk load. Small LRU so memory stays bounded.
+_VS_MEMORY: "OrderedDict[str, FAISS]" = OrderedDict()
+_VS_MEMORY_MAX = int(os.getenv("OMNIRAG_MEMORY_INDEXES", "8"))
+_VS_LOCK = threading.Lock()
+
+
+def _remember_vectorstore(file_hash: str, vectorstore) -> None:
+    with _VS_LOCK:
+        _VS_MEMORY[file_hash] = vectorstore
+        _VS_MEMORY.move_to_end(file_hash)
+        while len(_VS_MEMORY) > _VS_MEMORY_MAX:
+            _VS_MEMORY.popitem(last=False)
+
+
+def _recall_vectorstore(file_hash: str):
+    with _VS_LOCK:
+        vectorstore = _VS_MEMORY.get(file_hash)
+        if vectorstore is not None:
+            _VS_MEMORY.move_to_end(file_hash)
+        return vectorstore
+
+
+# ── State ─────────────────────────────────────────────────────────────────────
 
 class State(TypedDict):
-    file_type:str
-    question:str
-    answer:str
-    file_path:str
-    documents:List[Document]
-    pdf_type:str
-    chunks:List[Document]
-    vectorstore:object
-    retrieved_docs:List[Document]
-    filtered_docs:List[Document]
+    filetype: str
+    question: str
+    answer: str
+    search_query: str
+    file_paths: List[str]
+    collection_name: str
+    file_hash: str
+    from_cache: bool
+    documents: List[Document]
+    skipped_files: List[str]
+    pdf_type: str
+    chunks: List[Document]
+    vectorstore: object
+    retrieved_docs: List[Document]
+    reranked_docs: List[Document]
+    filtered_docs: List[Document]
     retrieval_attempts: int
     sufficient: str
     critic_verdict: str
     critic_reason: str
     critic_attempts: int
-    ragas_scores: dict
+    evaluation: dict
+    final_verdict: str
+    final_reason: dict
 
-def filetype_node(state:State):
+
+# ── Cache lookup (runs before any loading/chunking/embedding) ────────────────
+
+def compute_hash_node(state: State):
     
-    ext = os.path.splitext(state["file_path"])[1].lower()
-    if ext == ".csv":
-        return {"filetype": "csv"}
+    if state.get("collection_name"):
+        return {"file_hash": "collection:" + _collection_id(state["collection_name"])}
 
-    elif ext == ".pdf":
-        return {"filetype": "pdf"}
+    per_file_hashes = []
+    for file_path in state["file_paths"]:
+        with open(file_path, "rb") as f:
+            content = f.read()
+        per_file_hashes.append(hashlib.md5(content).hexdigest())
 
-    elif ext in [".png", ".jpg", ".jpeg", ".bmp"]:
-        return {"filetype": "image"}
+    combined = "docling-hybrid-chunks-v1|" + "|".join(sorted(per_file_hashes))
+    file_hash = hashlib.md5(combined.encode("utf-8")).hexdigest()
 
-    return {"filetype": "unknown"}
+    return {"file_hash": file_hash}
 
-def route_file_type(state):
 
-    filetype = state["filetype"]
+def _cache_path(file_hash: str) -> str:
+    return os.path.join(CACHE_DIR, file_hash)
 
-    if filetype == "csv":
-        return "csv_loader_node"
 
-    elif filetype == "pdf":
-        return "pdf_classification_node"
+def route_cache(state: State):
+    if state.get("collection_name"):
+        index_file = os.path.join(_collection_path(state["collection_name"]), "index.faiss")
+    else:
+        index_file = os.path.join(_cache_path(state["file_hash"]), "index.faiss")
 
-    elif filetype == "image":
-        return "image_loader"
+    if os.path.exists(index_file):
+        return "load_cache_node"
 
-    return END
+    return "load_documents_node"
 
-def csv_loader_node(state:State):
 
-    filepath=state["file_path"]
+def load_cache_node(state: State):
+    if state.get("collection_name"):
+        vectorstore = get_collection_vectorstore(state["collection_name"])
+    else:
+        vectorstore = _recall_vectorstore(state["file_hash"])
 
-    loader = CSVLoader(
-        file_path=filepath,
-        encoding="utf-8"
-    )
-
-    docs = loader.load()
-
-    return {"documents": docs}
-
-def pdf_classification_node(state:State):
-    import pdfplumber
-
-    filepath = state["file_path"]
-
-    try:
-        with pdfplumber.open(filepath) as pdf:
-            text = ""
-
-            for page in pdf.pages[:3]:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text
-
-        if len(text.strip()) > 100:
-            return {"pdf_type": "text"}
-
-    except:
-        pass
-
-    return {"pdf_type": "scanned"}
-
-def route_pdf_type(state):
-
-    if state["pdf_type"] == "text":
-        return "pdf_loader_node"
-
-    return "scanned_pdf_loader_node"
-
-def pdf_loader_node(state:State):
-    loader = PyPDFLoader(state["file_path"])
-    docs = loader.load()
-
-    return {"documents": docs}
-
-def scanned_pdf_loader_node(state:State):
-    from pdf2image import convert_from_path
-
-    images = convert_from_path(state["file_path"], 
-                               poppler_path=r"C:\Users\DELL\Downloads\Release-26.02.0-0\poppler-26.02.0\Library\bin")
-
-    text = ""
-    from paddleocr import PaddleOCR
-
-    ocr = PaddleOCR(use_angle_cls=True)
-    for img in images:
-
-        temp_path = "temp.png"
-        img.save(temp_path)
-
-        result = ocr.ocr(temp_path)
-
-        for page in result:
-            for line in page:
-                text += line[1][0] + "\n"
+        if vectorstore is None:
+            vectorstore = FAISS.load_local(
+                _cache_path(state["file_hash"]),
+                embeddings,
+                allow_dangerous_deserialization=True
+            )
+            _remember_vectorstore(state["file_hash"], vectorstore)
 
     return {
-        "documents": [
-            Document(page_content=text)
-        ]
+        "vectorstore": vectorstore,
+        "from_cache": True
     }
 
-def image_loader(state:State):
 
-    filepath=state["file_path"]
-    from paddleocr import PaddleOCR
+def save_cache_node(state: State):
+    state["vectorstore"].save_local(_cache_path(state["file_hash"]))
+    _remember_vectorstore(state["file_hash"], state["vectorstore"])
 
-    ocr = PaddleOCR(use_angle_cls=True)
-    result = ocr.ocr(filepath)
+    return {"from_cache": False}
 
-    text = ""
 
-    for page in result:
-        for line in page:
-            text += line[1][0] + "\n"
+# ── File type detection & per-file loading ────────────────────────────────────
 
-    return {"documents": [
-        Document(
-            page_content=text,
-            metadata={"source": filepath}
-        )]
-    }
+DOCLING_EXTENSIONS = {
+    # Documents
+    ".pdf", ".docx", ".doc", ".odt", ".epub",
 
-# Chunking
+    # Spreadsheets
+    ".xlsx", ".xls", ".ods",
 
-def chunking_node(state:State):
-    
-    splitter = RecursiveCharacterTextSplitter(
-    chunk_size=800,
-    chunk_overlap=150,
-    separators=[
-        "\n\n",
-        "\n",
-        ". ",
-        " ",
-        ""]
+    # Presentations
+    ".pptx", ".ppt", ".odp",
+
+    # Images
+    ".png", ".jpeg", ".jpg", ".tiff", ".tif", ".bmp", ".webp",
+
+    # Web
+    ".html", ".xhtml",
+
+    # Markup / text
+    ".md", ".markdown", ".adoc", ".asciidoc", ".tex", ".latex",
+
+    # Email
+    ".eml", ".msg",
+
+    # Captions
+    ".vtt",
+}
+
+
+def _detect_filetype(file_path: str) -> str:
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".csv":
+        return "csv"
+    elif ext in DOCLING_EXTENSIONS:
+        return "docling"
+    return "unsupported"
+
+
+def _load_csv(file_path: str) -> List[Document]:
+    loader = CSVLoader(
+        file_path=file_path,
+        encoding="utf-8"
     )
-    chunks = splitter.split_documents(state["documents"])
+    return loader.load()
+
+
+_DOCLING_CONVERTER = None
+_DOCLING_LOCK = threading.Lock()
+_DOCLING_CHUNKER = None
+_DOCLING_CHUNKER_LOCK = threading.Lock()
+
+
+def _get_docling_converter():
+    """DocumentConverter is expensive to build; create it once and reuse it."""
+    global _DOCLING_CONVERTER
+    if _DOCLING_CONVERTER is None:
+        with _DOCLING_LOCK:
+            if _DOCLING_CONVERTER is None:
+                _DOCLING_CONVERTER = DocumentConverter()
+    return _DOCLING_CONVERTER
+
+
+def _get_docling_chunker():
+    """Create Docling's structure-aware chunker once and reuse it."""
+    global _DOCLING_CHUNKER
+    if _DOCLING_CHUNKER is None:
+        with _DOCLING_CHUNKER_LOCK:
+            if _DOCLING_CHUNKER is None:
+                try:
+                    from docling.chunking import HybridChunker
+                except ImportError:
+                    # Support installations that expose HybridChunker from docling-core.
+                    from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
+                _DOCLING_CHUNKER = HybridChunker(merge_peers=True)
+    return _DOCLING_CHUNKER
+
+
+def _load_docling(file_path: str) -> List[Document]:
+    """Convert with Docling and preserve structure/provenance per chunk.
+
+    HybridChunker retains heading/table context and source provenance. Exporting
+    the whole document to Markdown before chunking would lose page-level links.
+    """
+    converter = _get_docling_converter()
+    result = converter.convert(file_path)
+    chunker = _get_docling_chunker()
+    documents: List[Document] = []
+
+    for chunk_index, chunk in enumerate(chunker.chunk(result.document), start=1):
+        content = (chunker.contextualize(chunk) or getattr(chunk, "text", "") or "").strip()
+        if not content:
+            continue
+
+        chunk_meta = getattr(chunk, "meta", None)
+        page_numbers = set()
+        for item in (getattr(chunk_meta, "doc_items", None) or []):
+            for provenance in (getattr(item, "prov", None) or []):
+                page_number = getattr(provenance, "page_no", None)
+                if page_number is not None:
+                    page_numbers.add(page_number)
+
+        # Some Docling versions also expose a page number on origin.
+        origin_page = getattr(getattr(chunk_meta, "origin", None), "page_no", None)
+        if not page_numbers and origin_page is not None:
+            page_numbers.add(origin_page)
+
+        headings = list(getattr(chunk_meta, "headings", None) or [])
+        documents.append(Document(
+            page_content=content,
+            metadata={
+                "source": os.path.basename(file_path),
+                "page_numbers": sorted(
+                    page_numbers,
+                    key=lambda value: (0, int(value)) if str(value).isdigit() else (1, str(value)),
+                ),
+                "headings": headings,
+                "chunk_id": chunk_index,
+                "_docling_hybrid_chunk": True,
+            },
+        ))
+
+    return documents
+
+
+_LOADERS = {
+    "csv": _load_csv,
+    "docling": _load_docling,
+}
+
+
+def load_documents_node(state: State):
+    
+    all_docs: List[Document] = []
+    skipped: List[str] = []
+
+    for file_path in state["file_paths"]:
+        name = os.path.basename(file_path)
+        filetype = _detect_filetype(file_path)
+        loader = _LOADERS.get(filetype)
+
+        if loader is None:
+            skipped.append(f"{name} (unsupported format)")
+            continue
+
+        try:
+            docs = loader(file_path)
+        except Exception as e:
+            skipped.append(f"{name} (failed to load: {e})")
+            continue
+
+        if not docs or not any(d.page_content.strip() for d in docs):
+            skipped.append(f"{name} (no content extracted)")
+            continue
+
+        for doc in docs:
+            doc.metadata["source"] = name
+
+        all_docs.extend(docs)
+
+    return {
+        "documents": all_docs,
+        "skipped_files": skipped,
+    }
+
+
+# ── Chunking ───────────────────────────────────────────────────────────────────
+
+def chunking_node(state: State):
+    
+    documents = state["documents"]
+    hybrid_chunks = [doc for doc in documents if doc.metadata.get("_docling_hybrid_chunk")]
+    plain_documents = [doc for doc in documents if not doc.metadata.get("_docling_hybrid_chunk")]
+
+    chunks = list(hybrid_chunks)
+    if plain_documents:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=150,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+        chunks.extend(splitter.split_documents(plain_documents))
 
     return {"chunks": chunks}
 
-# Storing Embedding in Vector Store
+
+def ingest_files_into_collection(collection_name: str, file_paths: List[str], file_names: List[str]) -> dict:
+    """Add only previously unseen file contents to a named persistent collection.
+
+    Document extraction and chunking reuse the same loaders and chunking node as
+    the normal pipeline; existing FAISS vectors are appended to, not rebuilt.
+    """
+    collection = ensure_knowledge_collection(collection_name)
+    collection_name = collection["name"]
+    path = _collection_path(collection_name)
+    manifest_path = os.path.join(path, "collection.json")
+    index_path = os.path.join(path, "index.faiss")
+    file_names = list(file_names or [])
+    file_paths = list(file_paths or [])
+    if len(file_paths) != len(file_names):
+        raise ValueError("Uploaded file paths and names do not match.")
+
+    with _collection_lock(collection_name):
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        known_hashes = {item.get("sha256") for item in manifest.get("files", [])}
+        existing_vs = None
+        cache_key = "collection:" + _collection_id(collection_name)
+        if os.path.isfile(index_path):
+            existing_vs = _recall_vectorstore(cache_key)
+            if existing_vs is None:
+                existing_vs = FAISS.load_local(path, embeddings, allow_dangerous_deserialization=True)
+                _remember_vectorstore(cache_key, existing_vs)
+
+        docs_to_add: List[Document] = []
+        manifest_additions: list[dict] = []
+        added_names: list[str] = []
+        already_present: list[str] = []
+        skipped: list[str] = []
+        for file_path, display_name in zip(file_paths, file_names):
+            digest = hashlib.sha256()
+            with open(file_path, "rb") as f:
+                for block in iter(lambda: f.read(1024 * 1024), b""):
+                    digest.update(block)
+            file_digest = digest.hexdigest()
+            if file_digest in known_hashes:
+                already_present.append(display_name)
+                continue
+
+            filetype = _detect_filetype(file_path)
+            loader = _LOADERS.get(filetype)
+            if loader is None:
+                skipped.append(f"{display_name} (unsupported format)")
+                continue
+            try:
+                file_docs = loader(file_path)
+            except Exception as exc:
+                skipped.append(f"{display_name} (failed to load: {type(exc).__name__}: {exc})")
+                continue
+            if not file_docs or not any(doc.page_content.strip() for doc in file_docs):
+                skipped.append(f"{display_name} (no content extracted)")
+                continue
+
+            for doc in file_docs:
+                doc.metadata["source"] = display_name
+                doc.metadata.setdefault("page_numbers", [])
+                doc.metadata.setdefault("headings", [])
+            docs_to_add.extend(file_docs)
+            manifest_additions.append({"name": display_name, "sha256": file_digest})
+            added_names.append(display_name)
+            known_hashes.add(file_digest)
+
+        chunks = chunking_node({"documents": docs_to_add}).get("chunks", []) if docs_to_add else []
+        if chunks:
+            if existing_vs is None:
+                existing_vs = FAISS.from_documents(chunks, embeddings)
+            else:
+                existing_vs.add_documents(chunks)
+                # BM25 is cached on the FAISS object; invalidate after appending.
+                if hasattr(existing_vs, "_omnirag_bm25"):
+                    try:
+                        delattr(existing_vs, "_omnirag_bm25")
+                    except Exception:
+                        setattr(existing_vs, "_omnirag_bm25", None)
+            existing_vs.save_local(path)
+            _remember_vectorstore(cache_key, existing_vs)
+
+        if existing_vs is None:
+            if skipped:
+                raise ValueError("No usable files were added. " + "; ".join(skipped))
+            raise ValueError(f"Collection '{collection_name}' has no indexed documents yet. Upload at least one file first.")
+
+        if manifest_additions:
+            manifest.setdefault("files", []).extend(manifest_additions)
+            _write_collection_manifest(manifest_path, manifest)
+
+        return {
+            "name": collection_name,
+            "files_added": added_names,
+            "files_already_present": already_present,
+            "skipped_files": skipped,
+            "new_chunks": len(chunks),
+            "total_files": len(manifest.get("files", [])),
+        }
 
 
-def vectorstore_node(state:State):
+# ── Storing embeddings in vector store ────────────────────────────────────────
+
+def vectorstore_node(state: State):
     vectorstore = FAISS.from_documents(
         documents=state["chunks"],
         embedding=embeddings
@@ -218,9 +580,76 @@ def vectorstore_node(state:State):
         "vectorstore": vectorstore
     }
 
-# Retrival
+
+# ── Hybrid retrieval (dense vector + sparse lexical, fused with RRF) ─────────
+
+def _tokenize(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _all_indexed_docs(vectorstore: FAISS) -> List[Document]:
+    """Pull every chunk out of the FAISS docstore.
+
+    Works whether we just built the vectorstore this request or loaded it
+    from the on-disk cache (in which case we never had the raw `chunks` list
+    in memory), so BM25 always has the full corpus to search.
+    """
+    docstore = getattr(vectorstore, "docstore", None)
+    data = getattr(docstore, "_dict", None)
+    if isinstance(data, dict):
+        return list(data.values())
+    return []
+
+
+def _get_bm25(vectorstore: FAISS):
+    """Build the BM25 index once per vectorstore instead of on every retrieval
+    pass (the graph can retrieve up to 3-5 times per question)."""
+    cached = getattr(vectorstore, "_omnirag_bm25", None)
+    if cached is None:
+        docs = _all_indexed_docs(vectorstore)
+        tokenized_corpus = [_tokenize(doc.page_content) for doc in docs]
+        bm25 = BM25Okapi(tokenized_corpus) if tokenized_corpus else None
+        cached = (docs, bm25)
+        try:
+            setattr(vectorstore, "_omnirag_bm25", cached)
+        except Exception:
+            pass
+    return cached
+
+
+def _bm25_search(query: str, docs: List[Document], top_n: int, bm25=None) -> List[Document]:
+    if not docs:
+        return []
+    if bm25 is None:
+        tokenized_corpus = [_tokenize(doc.page_content) for doc in docs]
+        bm25 = BM25Okapi(tokenized_corpus)
+    scores = bm25.get_scores(_tokenize(query))
+    ranked = sorted(range(len(docs)), key=lambda i: scores[i], reverse=True)
+    return [docs[i] for i in ranked[:top_n] if scores[i] > 0]
+
+
+def _reciprocal_rank_fusion(
+    ranked_lists: List[List[Document]],
+    limit: int,
+    k: int = RRF_K,
+) -> List[Document]:
+    """Merge several ranked document lists into one ranking.
+    """
+    scores: dict[str, float] = {}
+    objects: dict[str, Document] = {}
+    for ranked_docs in ranked_lists:
+        for rank, doc in enumerate(ranked_docs, start=1):
+            key = doc.metadata.get("source", "") + f"::{hash(doc.page_content)}"
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+            objects[key] = doc
+    ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    return [objects[key] for key, _ in ordered[:limit]]
+
 
 def retrieval_node(state: State):
+
+    search_query = (state.get("search_query") or state["question"])
+
 
     retrieval_attempts = state.get(
         "retrieval_attempts",
@@ -242,24 +671,50 @@ def retrieval_node(state: State):
         20
     )
 
+    # Dense/vector leg: FAISS with MMR for some built-in diversity.
     retriever = state["vectorstore"].as_retriever(
         search_type="mmr",
         search_kwargs={
             "k": k,
-            "fetch_k": min(
-                k * 3,
-                50
-            )
+            "fetch_k": min(max(VECTOR_CANDIDATES, k * 3), 50)
         }
     )
+    vector_docs = retriever.invoke(search_query)
 
-    docs = retriever.invoke(
-        state["question"]
-    )
+    # Sparse/lexical leg: BM25 over the full indexed corpus.
+    all_docs, bm25 = _get_bm25(state["vectorstore"])
+    lexical_docs = _bm25_search(search_query, all_docs, min(max(LEXICAL_CANDIDATES, k * 2), 50), bm25)
+
+    # Fuse the two rankings instead of just concatenating or picking one.
+    fused_docs = _reciprocal_rank_fusion([vector_docs, lexical_docs], limit=max(k, RERANK_TOP_N))
 
     return {
-        "retrieved_docs": docs
+        "retrieved_docs": fused_docs
     }
+
+
+# ── Reranking ──────────────────────────────────────────────────────────────────
+#
+# The fused hybrid list is still ranked by cheap proxies (embedding distance,
+# BM25 term overlap). A cross-encoder jointly reads (question, chunk) pairs
+# and scores relevance directly, which is slower but meaningfully more
+# accurate, so we use it to reorder/trim before the expensive LLM grading step.
+
+def rerank_node(state: State):
+    docs = state.get("retrieved_docs", [])
+    if not docs:
+        return {"reranked_docs": []}
+
+    pairs = [(state["question"], doc.page_content) for doc in docs]
+    scores = reranker.predict(pairs)
+
+    ranked = sorted(zip(docs, scores), key=lambda pair: pair[1], reverse=True)
+    top_docs = [doc for doc, _ in ranked[:RERANK_TOP_N]]
+
+    return {
+        "reranked_docs": top_docs
+    }
+
 
 class GradeDocuments(BaseModel):
     """Binary score for relevance check."""
@@ -267,6 +722,7 @@ class GradeDocuments(BaseModel):
     binary_score: str = Field(
         description="Document is relevant to the question, 'yes' or 'no'"
     )
+
 
 structured_llm = llm.with_structured_output(GradeDocuments)
 
@@ -301,37 +757,47 @@ grade_prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
-retrieval_grader = grade_prompt | structured_llm    
+retrieval_grader = grade_prompt | structured_llm
 
-def filter_chunks_node(state:State):
+
+def filter_chunks_node(state: State):
     question = state["question"]
-    docs = state["retrieved_docs"]
+    docs = state.get("reranked_docs") or state["retrieved_docs"]
 
-    filtered_docs = []
+    if not docs:
+        return {"filtered_docs": []}
 
-    for doc in docs:
+    # Grade every retrieved chunk CONCURRENTLY instead of one-by-one in a
+    # for-loop. This is the single biggest latency fix: 20 sequential LLM
+    # calls (~20-40s) becomes a handful of parallel batches.
+    inputs = [
+        {"question": question, "document": doc.page_content}
+        for doc in docs
+    ]
 
-        result = retrieval_grader.invoke(
-            {
-                "question": question,
-                "document": doc.page_content
-            }
-        )
+    results = retrieval_grader.batch(
+        inputs,
+        config={"max_concurrency": GRADER_MAX_CONCURRENCY}
+    )
 
-        if result.binary_score.lower() == "yes":
-            filtered_docs.append(doc)
+    filtered_docs = [
+        doc for doc, result in zip(docs, results)
+        if result.binary_score.lower() == "yes"
+    ]
 
     return {
         "filtered_docs": filtered_docs
     }
 
-# Checking if there are enough Document to generate answer.
+
+# ── Checking if there is enough context to generate an answer ────────────────
 
 class SufficiencyGrade(BaseModel):
 
     sufficient: str = Field(
         description="Whether the provided documents are sufficient to answer the question. Return only 'yes' or 'no'."
     )
+
 
 structured_llm2 = llm.with_structured_output(
     SufficiencyGrade
@@ -377,7 +843,8 @@ sufficiency_chain = (
     | structured_llm2
 )
 
-def check_context_sufficiency_node(state:State):
+
+def check_context_sufficiency_node(state: State):
 
     docs_text = "\n\n".join(
         doc.page_content
@@ -395,23 +862,25 @@ def check_context_sufficiency_node(state:State):
         "sufficient": result.sufficient
     }
 
+
 def route_after_sufficiency(state):
 
     sufficient = state["sufficient"]
     attempts = state.get(
-    "retrieval_attempts",0)
-    
+        "retrieval_attempts", 0)
+
     if sufficient.lower() == "yes":
         return "generate_answer"
 
-    if attempts >= 3:
+    if attempts >= MAX_RETRIEVAL_ATTEMPTS:
         return "generate_answer"
 
     return "increase_attempts_node"
 
+
 def increase_attempts_node(state: State):
 
-     return {
+    return {
         "retrieval_attempts":
             state.get(
                 "retrieval_attempts",
@@ -419,7 +888,52 @@ def increase_attempts_node(state: State):
             ) + 1
     }
 
-# Answer Generation
+
+# ── Query Rewriting ─────────────────────────────────────────────
+
+query_rewrite_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """
+        You are a query rewriting component in a RAG system.
+
+        Rewrite the user's question into a clear, specific,
+        standalone search query suitable for hybrid retrieval.
+
+        Rules:
+        - Preserve the original intent.
+        - Resolve ambiguity where possible.
+        - Include important keywords and entities.
+        - Do not answer the question.
+        - Return only the rewritten query.
+        """
+    ),
+    (
+        "human",
+        """
+        Original question:
+        {question}
+
+        Retrieved context was insufficient.
+        Produce an improved search query.
+        """
+    )
+])
+
+query_rewrite_chain = query_rewrite_prompt | llm | StrOutputParser()
+
+
+def query_rewriting_node(state: State):
+    rewritten_query = query_rewrite_chain.invoke({
+        "question": state["question"]
+    }).strip()
+
+    return {
+        "search_query": rewritten_query or state["question"]
+    }
+
+
+# ── Answer generation ──────────────────────────────────────────────────────────
 
 answer_prompt = ChatPromptTemplate.from_messages(
     [
@@ -435,6 +949,9 @@ answer_prompt = ChatPromptTemplate.from_messages(
             - Do not make up facts.
             - If the context does not contain enough information,
               clearly say so.
+            - Cite supporting chunks with the source IDs exactly as supplied,
+              for example [S1] or [S2]. Never invent source IDs.
+            - Add source citations to factual claims where supported by context.
             - Be concise and accurate.
             """
         ),
@@ -452,23 +969,57 @@ answer_prompt = ChatPromptTemplate.from_messages(
 )
 answer_chain = answer_prompt | llm
 
-def generation_node(state:State):
 
-    context = "\n\n".join(
-        doc.page_content
-        for doc in state["filtered_docs"]
-    )
+def _format_context_with_citations(docs: List[Document]) -> str:
+    """Label context chunks with source IDs used by the answer and Sources UI."""
+    formatted = []
+    for index, doc in enumerate(docs, start=1):
+        metadata = doc.metadata or {}
+        source = metadata.get("source") or "Unknown source"
+        pages = metadata.get("page_numbers") or []
+        if not pages and metadata.get("page_number") is not None:
+            pages = [metadata["page_number"]]
+        headings = metadata.get("headings") or []
 
-    response = answer_chain.invoke(
+        location_parts = []
+        if pages:
+            location_parts.append("page " + ", ".join(str(page) for page in pages))
+        if headings:
+            location_parts.append("section " + " > ".join(str(item) for item in headings))
+        location = f" ({'; '.join(location_parts)})" if location_parts else ""
+        formatted.append(
+            f"[S{index}] Source: {source}{location}\nContent:\n{doc.page_content}"
+        )
+    return "\n\n".join(formatted)
+
+
+def generation_node(state: State):
+    """Generate the answer and publish each text chunk to LangGraph.
+
+    Returning the joined text keeps the graph state unchanged, while the
+    custom stream writer lets the API send text to the UI as LLM produces
+    it instead of waiting for a completed ``invoke()`` response.
+    """
+    context = _format_context_with_citations(state.get("filtered_docs", []))
+
+    writer = get_stream_writer()
+    answer_parts: List[str] = []
+    for chunk in answer_chain.stream(
         {
             "question": state["question"],
-            "context": context
+            "context": context,
         }
-    )
+    ):
+        text = _to_text(chunk.content)
+        if not text:
+            continue
+        answer_parts.append(text)
+        writer({"type": "token", "text": text})
 
     return {
-        "answer": response.content
+        "answer": "".join(answer_parts)
     }
+
 
 class CriticGrade(BaseModel):
 
@@ -488,6 +1039,8 @@ class CriticGrade(BaseModel):
         irrelevant_answer
         """
     )
+
+
 critic_prompt = ChatPromptTemplate.from_messages(
     [
         (
@@ -540,12 +1093,11 @@ critic_chain = (
         CriticGrade
     )
 )
+
+
 def critic_node(state):
 
-    context = "\n\n".join(
-        doc.page_content
-        for doc in state["filtered_docs"]
-    )
+    context = _format_context_with_citations(state.get("filtered_docs", []))
 
     result = critic_chain.invoke(
         {
@@ -563,19 +1115,19 @@ def critic_node(state):
 
 def route_after_critic(state: State):
 
-    verdict = state["critic_verdict"]
+    verdict = (state["critic_verdict"] or "").strip().lower()
 
     if verdict == "pass":
-        return "ragas_evaluation_node"
+        return "finish"
 
-    if state.get("critic_attempts", 0) >= 3:
+    if state.get("critic_attempts", 0) >= MAX_CRITIC_ATTEMPTS:
         return "answer_not_found"
 
     return "increase_critic_attempts"
 
+
 def increase_critic_attempts(state: State):
 
-    
     return {
         "critic_attempts":
             state.get(
@@ -584,15 +1136,23 @@ def increase_critic_attempts(state: State):
             ) + 1
     }
 
+
+def _not_found_message(state: State) -> str:
+    skipped = state.get("skipped_files") or []
+    if skipped and not state.get("documents"):
+        return "None of the uploaded files could be read: " + "; ".join(skipped)
+    return "Answer not found in the uploaded documents."
+
+
 def answer_not_found_node(state: State):
 
     return {
-        "answer": "Answer not found in the uploaded documents.",
+        "answer": _not_found_message(state),
 
         "final_verdict": "answer_not_found",
 
         "final_reason": {
-            "critic_attempts": state.get("critic_attempts",0),
+            "critic_attempts": state.get("critic_attempts", 0),
             "last_critic_reason": state.get(
                 "critic_reason",
                 "unknown"
@@ -601,106 +1161,25 @@ def answer_not_found_node(state: State):
     }
 
 
+# ── Graph construction ─────────────────────────────────────────────────────────
 
+def route_after_load(state: State):
+    # Every file unsupported/unreadable -> stop here instead of crashing FAISS
+    # with an empty document list.
+    if state.get("documents"):
+        return "chunking_node"
 
+    return "answer_not_found"
 
-eval_prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        """
-        You are an evaluation agent for a RAG system.
-        Given a question, context, and answer, score the answer on 4 metrics.
-        Return ONLY a JSON object with these exact keys and float scores between 0.0 and 1.0:
-
-        {{
-            "faithfulness": <float>,
-            "answer_relevancy": <float>,
-            "context_precision": <float>,
-            "context_recall": <float>
-        }}
-
-        Metric definitions:
-        - faithfulness: Is the answer fully supported by the context? (1.0 = fully supported, 0.0 = hallucinated)
-        - answer_relevancy: Does the answer directly address the question? (1.0 = perfectly relevant)
-        - context_precision: Is the retrieved context focused and free of noise? (1.0 = very precise)
-        - context_recall: Does the context contain all info needed to answer? (1.0 = complete coverage)
-
-        Return ONLY the JSON. No explanation, no markdown, no extra text.
-        """
-    ),
-    (
-        "human",
-        """
-        Question: {question}
-
-        Context: {context}
-
-        Answer: {answer}
-        """
-    )
-])
-
-eval_chain = eval_prompt | llm | StrOutputParser()
-
-def ragas_evaluation_node(state: State):
-    import json
-
-    context = "\n\n".join(
-        doc.page_content
-        for doc in state["filtered_docs"]
-    )
-
-    raw = eval_chain.invoke({
-        "question": state["question"],
-        "context": context,
-        "answer": state["answer"]
-    })
-
-    try:
-        clean = raw.strip().replace("```json", "").replace("```", "").strip()
-        scores = json.loads(clean)
-    except Exception:
-        scores = {
-            "faithfulness": 0.0,
-            "answer_relevancy": 0.0,
-            "context_precision": 0.0,
-            "context_recall": 0.0,
-            "error": "Failed to parse scores"
-        }
-
-    return {"ragas_scores": scores}
-    
-
-# Graph Construction 
 
 builder = StateGraph(State)
 
-# Adding Nodes
+# Cache check (new)
+builder.add_node("compute_hash_node", compute_hash_node)
+builder.add_node("load_cache_node", load_cache_node)
+builder.add_node("save_cache_node", save_cache_node)
 
-builder.add_node("filetype_node", filetype_node)
-builder.add_node("route_file_type", route_file_type)
-
-builder.add_node("csv_loader_node", csv_loader_node)
-
-builder.add_node(
-    "pdf_classification_node",
-    pdf_classification_node
-)
-
-builder.add_node(
-    "pdf_loader_node",
-    pdf_loader_node
-)
-
-builder.add_node(
-    "scanned_pdf_loader_node",
-    scanned_pdf_loader_node
-)
-
-builder.add_node(
-    "image_loader",
-    image_loader
-)
+builder.add_node("load_documents_node", load_documents_node)
 
 builder.add_node(
     "chunking_node",
@@ -718,6 +1197,11 @@ builder.add_node(
 )
 
 builder.add_node(
+    "rerank_node",
+    rerank_node
+)
+
+builder.add_node(
     "filter_chunks_node",
     filter_chunks_node
 )
@@ -730,6 +1214,11 @@ builder.add_node(
 builder.add_node(
     "increase_attempts_node",
     increase_attempts_node
+)
+
+builder.add_node(
+    "query_rewriting_node",
+    query_rewriting_node
 )
 
 builder.add_node(
@@ -752,63 +1241,31 @@ builder.add_node(
     answer_not_found_node
 )
 
-builder.add_node(
-    "ragas_evaluation_node",
-    ragas_evaluation_node
-)
+# ── Edges ────────────────────────────────────────────────────────────────────
 
-# Add Edges
+builder.add_edge(START, "compute_hash_node")
 
-builder.add_edge(
-    START,
-    "filetype_node"
-)
-
+# Cache branch: skip load/chunk/embed entirely on a cache hit.
 builder.add_conditional_edges(
-    "filetype_node",
-    route_file_type,
+    "compute_hash_node",
+    route_cache,
     {
-        "csv_loader_node":
-            "csv_loader_node",
-
-        "pdf_classification_node":
-            "pdf_classification_node",
-
-        "image_loader":
-            "image_loader",
-
-        END: END
+        "load_cache_node": "load_cache_node",
+        "load_documents_node": "load_documents_node"
     }
 )
+
+builder.add_edge("load_cache_node", "retrieval_node")
+builder.add_edge("retrieval_node", "rerank_node")
+builder.add_edge("rerank_node", "filter_chunks_node")
+
 builder.add_conditional_edges(
-    "pdf_classification_node",
-    route_pdf_type,
+    "load_documents_node",
+    route_after_load,
     {
-        "pdf_loader_node":
-            "pdf_loader_node",
-
-        "scanned_pdf_loader_node":
-            "scanned_pdf_loader_node"
+        "chunking_node": "chunking_node",
+        "answer_not_found": "answer_not_found"
     }
-)
-builder.add_edge(
-    "csv_loader_node",
-    "chunking_node"
-)
-
-builder.add_edge(
-    "pdf_loader_node",
-    "chunking_node"
-)
-
-builder.add_edge(
-    "scanned_pdf_loader_node",
-    "chunking_node"
-)
-
-builder.add_edge(
-    "image_loader",
-    "chunking_node"
 )
 builder.add_edge(
     "chunking_node",
@@ -817,12 +1274,12 @@ builder.add_edge(
 
 builder.add_edge(
     "vectorstore_node",
-    "retrieval_node"
+    "save_cache_node"
 )
 
 builder.add_edge(
-    "retrieval_node",
-    "filter_chunks_node"
+    "save_cache_node",
+    "retrieval_node"
 )
 
 builder.add_edge(
@@ -842,6 +1299,11 @@ builder.add_conditional_edges(
 )
 builder.add_edge(
     "increase_attempts_node",
+    "query_rewriting_node"
+)
+
+builder.add_edge(
+    "query_rewriting_node",
     "retrieval_node"
 )
 builder.add_edge(
@@ -852,8 +1314,8 @@ builder.add_conditional_edges(
     "critic_node",
     route_after_critic,
     {
-        "ragas_evaluation_node":
-            "ragas_evaluation_node",
+        "finish":
+            END,
 
         "increase_critic_attempts":
             "increase_critic_attempts",
@@ -866,10 +1328,7 @@ builder.add_edge(
     "increase_critic_attempts",
     "retrieval_node"
 )
-builder.add_edge(
-    "ragas_evaluation_node",
-    END
-)
+
 
 builder.add_edge(
     "answer_not_found",
@@ -877,3 +1336,157 @@ builder.add_edge(
 )
 graph = builder.compile()
 
+
+# ── DeepEval Evaluation ──────────────────────────────────────────────────────
+
+# DeepEval's metrics default to an OpenAI judge. 
+# The three metrics are independent of each other,so they run in parallel threads rather than one after another.
+
+os.environ.setdefault("DEEPEVAL_TELEMETRY_OPT_OUT", "YES")
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from deepeval.models import DeepEvalBaseLLM
+from deepeval.test_case import LLMTestCase
+from deepeval.metrics import (
+    FaithfulnessMetric,
+    AnswerRelevancyMetric,
+    ContextualRelevancyMetric,
+)
+
+EVAL_THRESHOLD = 0.7
+EVAL_METRICS = ["faithfulness", "answer_relevancy", "contextual_relevancy"]
+
+
+def _extract_json(text: str) -> dict:
+    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        text = text[start:end + 1]
+    return json.loads(text)
+
+
+class OpenAIJuddge(DeepEvalBaseLLM):
+    """Lets DeepEval use the pipeline's own LangChain chat model as its judge."""
+
+    def __init__(self, chat_model, name: str = "gpt-4o-mini"):
+        self.chat_model = chat_model
+        super().__init__(name)
+
+    def load_model(self):
+        return self.chat_model
+
+    def generate(self, prompt: str, schema: Optional[type] = None):
+        if schema is None:
+            return _to_text(self.chat_model.invoke(prompt).content)
+        try:
+            return self.chat_model.with_structured_output(schema).invoke(prompt)
+        except Exception:
+            text = _to_text(self.chat_model.invoke(prompt).content)
+            return schema(**_extract_json(text))
+
+    async def a_generate(self, prompt: str, schema: Optional[type] = None):
+        if schema is None:
+            return _to_text((await self.chat_model.ainvoke(prompt)).content)
+        try:
+            return await self.chat_model.with_structured_output(schema).ainvoke(prompt)
+        except Exception:
+            text = _to_text((await self.chat_model.ainvoke(prompt)).content)
+            return schema(**_extract_json(text))
+
+    def get_model_name(self):
+        return "gpt-4o-mini"
+
+
+def eval_answer(state: State, progress_cb=None):
+    """
+    Evaluate an already generated RAG answer using DeepEval.
+
+    This node is called separately after the normal RAG workflow
+    has returned the answer. 
+    """
+
+    question = state["question"]
+    answer = state["answer"]
+
+    # Same context used during answer generation
+    filtered_docs = state.get("filtered_docs", [])
+
+    retrieval_context = [
+        doc.page_content
+        for doc in filtered_docs
+        if hasattr(doc, "page_content")
+    ]
+
+    
+    # DeepEval test case
+
+    test_case = LLMTestCase(
+        input=question,
+        actual_output=answer,
+        retrieval_context=retrieval_context,
+    )
+    # Metrics (one judge, sync mode so each runs cleanly in its own thread)
+    
+
+    judge = OpenAIJuddge(llm)
+
+    metrics = {
+        "faithfulness": FaithfulnessMetric(
+            threshold=EVAL_THRESHOLD, model=judge,
+            include_reason=True, async_mode=False,
+        ),
+        "answer_relevancy": AnswerRelevancyMetric(
+            threshold=EVAL_THRESHOLD, model=judge,
+            include_reason=True, async_mode=False,
+        ),
+        "contextual_relevancy": ContextualRelevancyMetric(
+            threshold=EVAL_THRESHOLD, model=judge,
+            include_reason=True, async_mode=False,
+        ),
+    }
+
+    def _run(name, metric):
+        metric.measure(test_case, _show_indicator=False)
+        score = metric.score
+        return {
+            "score": score,
+            "reason": metric.reason,
+            "passed": score is not None and score >= EVAL_THRESHOLD,
+        }
+    # Run all metrics in parallel
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(metrics)) as pool:
+        futures = {pool.submit(_run, n, m): n for n, m in metrics.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "score": None,
+                    "reason": f"Evaluation failed: {type(exc).__name__}: {exc}",
+                    "passed": False,
+                    "error": True,
+                }
+            results[name] = result
+            if progress_cb:
+                progress_cb(name, result)
+
+    # Collect score + reason 
+
+    evaluation = {name: results[name] for name in EVAL_METRICS}
+
+    # Overall score
+
+    scores = [r["score"] for r in evaluation.values() if r["score"] is not None]
+    overall_score = sum(scores) / len(scores) if scores else None
+
+    evaluation["overall"] = {
+        "score": overall_score,
+        "passed": overall_score is not None and overall_score >= EVAL_THRESHOLD,
+    }
+
+    return {
+        "evaluation": evaluation
+    }

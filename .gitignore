@@ -1,11 +1,55 @@
-__pycache__
+# Environment variables and secrets
 .env
-menv
-req.txt
+.env.*
+!.env.example
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+
+# Virtual environments and local tooling
+.venv/
+venv/
+env/
+ENV/
 menv/
 myenv/
+.agents/
+
+# RAG indexes, collections, and generated caches
+vectorstore_cache/
+knowledge_base_collections/
+.deepeval/
+
+# Test, coverage, build, and packaging output
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+dist/
+build/
+*.egg-info/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# IDE and operating-system files
+.DS_Store
+.idea/
+.vscode/
+.env
+.venv/
 venv/
 __pycache__/
-*.pyc
-.env
-.ipynb_checkpoints/
+*.py[cod]
+.streamlit/secrets.toml
+vectorstore_cache/
+knowledge_base_collections/
+data/
+.DS_Store

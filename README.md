@@ -1,670 +1,292 @@
-# 🚀 OmniRAG — Agentic RAG Explorer
+# OmniRAG AI
 
-<div align="center">
+**OmniRAG AI** is a document-grounded, agentic RAG application. Upload documents to a persistent knowledge collection, ask questions in a Streamlit chat interface, and receive streaming answers that are retrieved, ranked, checked for context sufficiency, cited, and reviewed by a critic before they are returned.
 
-### 🧠 Intelligent Multi-Format Document Question Answering with Agentic RAG
+The project consists of a Streamlit frontend, a FastAPI service, and a conditional LangGraph workflow. It is designed to answer from the supplied knowledge base rather than from the model's general knowledge.
 
-**Upload → Retrieve → Grade → Generate → Critique → Evaluate**
+## What it does
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge\&logo=python\&logoColor=white)](https://www.python.org/)
-[![LangChain](https://img.shields.io/badge/LangChain-Framework-1C3C3C?style=for-the-badge)](https://www.langchain.com/)
-[![LangGraph](https://img.shields.io/badge/LangGraph-Agentic%20Workflow-FF6B35?style=for-the-badge)](https://www.langchain.com/langgraph)
-[![FAISS](https://img.shields.io/badge/FAISS-Vector%20Search-0467DF?style=for-the-badge)](https://github.com/facebookresearch/faiss)
-[![Streamlit](https://img.shields.io/badge/Streamlit-UI-FF4B4B?style=for-the-badge\&logo=streamlit\&logoColor=white)](https://streamlit.io/)
-[![OpenAI](https://img.shields.io/badge/OpenAI-GPT--4o--mini-412991?style=for-the-badge\&logo=openai\&logoColor=white)](https://openai.com/)
+- Ingests and persists document collections.
+- Extracts structured content and provenance from many office, document, image, web, email, and caption formats.
+- Combines semantic and lexical search, then reranks and LLM-grades the retrieved chunks.
+- Retries with a rewritten query when the available context is insufficient.
+- Requires source-grounded answers with `[S1]`, `[S2]`, … citations.
+- Critiques each generated answer for unsupported claims, insufficient context, and relevance before accepting it.
+- Evaluates completed answers with DeepEval and exposes faithfulness, answer relevancy, and contextual relevancy scores.
 
-</div>
-
----
-
-## 🌟 Overview
-
-**OmniRAG** is an **agentic Retrieval-Augmented Generation (RAG) system** designed to answer questions from multiple types of user-uploaded documents.
-
-Unlike a basic RAG pipeline that simply retrieves documents and generates an answer, OmniRAG introduces multiple validation and self-correction stages to improve retrieval quality and reduce unsupported answers.
-
-### ✨ What makes OmniRAG different?
-
-* 📄 Multi-format document ingestion
-* 🔍 Automatic file-type detection
-* 🖼️ OCR support for images and scanned PDFs
-* ✂️ Intelligent document chunking
-* 🧬 Hugging Face embeddings
-* ⚡ FAISS vector search
-* 🎯 MMR-based retrieval
-* 🧑‍⚖️ LLM relevance grading
-* 📊 Context sufficiency checking
-* 🤖 Context-grounded answer generation
-* 🧐 Critic-based hallucination detection
-* 🔄 Automatic retry mechanism
-* 🚫 Answer-not-found protection
-* 📈 Four answer-quality evaluation metrics
-* 🎨 Interactive Streamlit interface
-
-OmniRAG currently supports **PDF, CSV and image inputs** through its Streamlit interface.
-
----
-
-# 🏗️ Architecture
+## Architecture
 
 ```mermaid
 flowchart TD
+    U[User: documents + question] --> UI["Streamlit frontend<br/>app.py"]
+    UI -->|NDJSON streaming / API key| API["FastAPI API<br/>api.py"]
+    API --> INGEST[Collection ingestion]
+    INGEST --> DOC[Docling conversion / CSV loader]
+    DOC --> CHUNK["Structure-aware chunking<br/>Docling HybridChunker or recursive splitter"]
+    CHUNK --> EMBED[BAAI/bge-small-en-v1.5 embeddings]
+    EMBED --> VS["Persistent FAISS index<br/>+ collection manifest"]
 
-    A[👤 User] --> B[📤 Upload Document]
+    API --> GRAPH["LangGraph orchestration<br/>main.py"]
+    GRAPH --> HASH[Hash / collection lookup]
+    HASH -->|index available| CACHE[Load FAISS cache]
+    HASH -->|new source data| DOC
+    CACHE --> RETRIEVE
+    VS --> RETRIEVE
 
-    B --> C{📁 File Type}
+    RETRIEVE["Hybrid retrieval<br/>MMR dense search + BM25 lexical search<br/>Reciprocal Rank Fusion"] --> RERANK["Cross-encoder reranking<br/>keep top 8"]
+    RERANK --> REL[Concurrent LLM relevance grading]
+    REL --> SUFF{Context sufficient?}
+    SUFF -->|yes| GENERATE["Grounded, streaming answer<br/>with source citations"]
+    SUFF -->|no; retry budget remains| REWRITE["Increment attempt<br/>and rewrite query"]
+    REWRITE --> RETRIEVE
+    SUFF -->|no; budget exhausted| GENERATE
+    GENERATE --> CRITIC{Critic verdict}
+    CRITIC -->|pass| RESPONSE[Answer + sources + trace]
+    CRITIC -->|fail; retry budget remains| EXPAND["Increment critic attempt<br/>and broaden retrieval"]
+    EXPAND --> RETRIEVE
+    CRITIC -->|fail; budget exhausted| NOTFOUND["Return: answer not found<br/>in uploaded documents"]
+    NOTFOUND --> RESPONSE
 
-    C -->|CSV| D[📊 CSV Loader]
-    C -->|PDF| E{📄 PDF Classification}
-    C -->|Image| F[🖼️ Image OCR]
-
-    E -->|Text PDF| G[📄 PyPDF Loader]
-    E -->|Scanned PDF| H[🔍 PDF → Images → PaddleOCR]
-
-    D --> I[✂️ Document Chunking]
-    G --> I
-    H --> I
-    F --> I
-
-    I --> J[🧬 BGE Embeddings]
-    J --> K[(🗂️ FAISS Vector Store)]
-
-    K --> L[🔎 MMR Retrieval]
-
-    L --> M[🎯 Relevance Grader]
-    M --> N[📚 Relevant Chunks]
-
-    N --> O{📊 Context Sufficient?}
-
-    O -->|❌ No| P[🔄 Increase Retrieval Attempts]
-    P --> L
-
-    O -->|✅ Yes| Q[🤖 Answer Generation]
-
-    Q --> R[🧐 Critic Agent]
-
-    R -->|✅ PASS| S[📈 Evaluation]
-
-    R -->|❌ FAIL| T{🔄 Retry Limit?}
-
-    T -->|No| P
-    T -->|Yes| U[❌ Answer Not Found]
-
-    S --> V[✅ Final Answer]
-
-    style A fill:#6366F1,color:#fff
-    style B fill:#0EA5E9,color:#fff
-    style K fill:#8B5CF6,color:#fff
-    style M fill:#F59E0B,color:#fff
-    style O fill:#F97316,color:#fff
-    style Q fill:#10B981,color:#fff
-    style R fill:#EC4899,color:#fff
-    style S fill:#22C55E,color:#fff
-    style U fill:#EF4444,color:#fff
-    style V fill:#14B8A6,color:#fff
+    RESPONSE --> EVAL[Optional DeepEval evaluation]
+    EVAL --> METRICS["Faithfulness · Answer relevancy<br/>Contextual relevancy"]
 ```
 
----
+### Why the graph is dynamic
 
-# 🔄 OmniRAG Pipeline
+The workflow is conditional at multiple points rather than following one fixed path:
+
+1. **Cache branch:** an existing collection index bypasses document conversion, chunking, and embedding. A new upload follows the ingestion path and is persisted to the collection.
+2. **Context branch:** after relevance filtering, an LLM decides whether the retrieved context is sufficient. If not, OmniRAG can make up to two expansion/rewrite retries before generation proceeds with the best available context.
+3. **Critic branch:** the critic accepts a grounded answer, or sends the graph back to retrieval. It can make up to two critic-driven retries; a repeatedly unsupported answer becomes an explicit “answer not found” response.
+4. **Failure branch:** unreadable or unsupported input does not create an empty index; the graph returns an explanatory result instead.
+
+The frontend receives the graph's node-by-node events and generated tokens as NDJSON, so it can display live pipeline progress and answer streaming.
+
+## Retrieval and context pipeline
+
+### 1. Document ingestion
+
+| Input type | Processing |
+| --- | --- |
+| CSV | LangChain `CSVLoader` preserves rows as documents. |
+| PDF, Word, spreadsheets, presentations, images, HTML, Markdown, email, captions, and more | Docling `DocumentConverter` extracts content. `HybridChunker` preserves headings, page provenance, and structure. |
+
+Supported backend extensions include PDF, DOC/DOCX, ODT, EPUB, XLS/XLSX/ODS, PPT/PPTX/ODP, PNG/JPEG/TIFF/BMP/WebP, HTML/XHTML, Markdown/AsciiDoc/LaTeX, EML/MSG, VTT, and CSV.
+
+For non-Docling CSV content, `RecursiveCharacterTextSplitter` uses 800-character chunks with 150-character overlap. Document-originated chunks retain source filename, page numbers, headings, and chunk identifiers.
+
+### 2. Persistent knowledge collections
+
+Collections are stored beneath `OMNIRAG_DATA_DIR` (the repository directory by default; `/data` in Docker):
+
+- `knowledge_base_collections/` holds a manifest and FAISS index for each named collection.
+- File contents are SHA-256 hashed during collection ingestion, so duplicate uploads are skipped.
+- A small in-memory LRU cache retains recently used FAISS indexes.
+- A file-hash cache also prevents rebuilding an index for the same source set.
+
+### 3. Hybrid retrieval
+
+OmniRAG runs two retrieval strategies for each query:
+
+- **Dense retrieval:** FAISS vector search using MMR for semantic relevance and diversity.
+- **Sparse retrieval:** BM25 lexical search over all indexed chunks.
+- **Fusion:** Reciprocal Rank Fusion (RRF) combines both rankings.
+- **Reranking:** `cross-encoder/ms-marco-MiniLM-L-6-v2` scores question/chunk pairs and keeps the best eight chunks by default.
+- **Relevance grading:** an LLM filters out chunks that cannot help answer the question. The grade calls run concurrently (default concurrency: 8).
+
+The candidate pool grows as the graph retries, up to 20 dense results. The relevant chunks become the answer context; this keeps unrelated retrieved material out of the final prompt.
+
+## Grounding and hallucination control
+
+OmniRAG uses layered controls; no RAG system can guarantee zero hallucinations, but these checks reduce unsupported output and make it visible:
+
+1. **Context-only generation:** the answer prompt instructs the model to use only supplied context, avoid invented facts, and say when the context is insufficient.
+2. **Source-aware context:** every selected chunk is labeled `[S1]`, `[S2]`, etc., with filename and—when available—page and heading metadata. Factual claims are expected to cite those IDs.
+3. **Relevance filtering:** LLM grading removes irrelevant chunks before they reach generation.
+4. **Sufficiency gate:** a separate grader checks completeness and coverage. Insufficient context triggers query rewriting and another retrieval cycle.
+5. **Post-generation critic:** the critic checks the answer against the same selected context and returns `pass` or `fail` with one of: `sufficient_context`, `insufficient_context`, `hallucination`, or `irrelevant_answer`.
+6. **Safe fallback:** if critique retries are exhausted, the system returns “Answer not found in the uploaded documents” instead of presenting a repeatedly failed answer as trustworthy.
+7. **Inspectable sources:** the UI exposes the retrieved chunks, citations, source names, pages, headings, and pipeline trace.
+
+## Models and technology
+
+| Area | Technology / model | Role |
+| --- | --- | --- |
+| Answering, grading, rewriting, critic | OpenAI `gpt-4o-mini` via LangChain | Deterministic (`temperature=0`) structured decisions and streamed answer generation. |
+| Embeddings | `BAAI/bge-small-en-v1.5` via Hugging Face | Creates vector representations for FAISS. |
+| Reranking | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Jointly ranks question/chunk pairs after hybrid retrieval. |
+| Vector store | FAISS | Local persistent semantic index. |
+| Sparse retrieval | BM25 (`rank-bm25`) | Keyword-aware lexical recall. |
+| Orchestration | LangGraph | Conditional, retry-capable RAG graph. |
+| Document intelligence | Docling | Multi-format conversion and structure-aware chunking. |
+| API | FastAPI + Uvicorn | Protected, rate-limited HTTP/NDJSON endpoints. |
+| UI | Streamlit | Collection management, uploads, chat, sources, pipeline trace, and evaluation. |
+| Evaluation | DeepEval | Faithfulness, answer relevancy, and contextual relevancy measurements. |
+| Packaging | Docker Compose | One-command local deployment. |
+
+## Evaluation
+
+Evaluation is run on demand after an answer completes, either from the UI or through the `/evaluate` endpoints. The same filtered retrieval context used for generation is evaluated with three DeepEval metrics:
+
+| Metric | What it checks |
+| --- | --- |
+| Faithfulness | Whether the answer is supported by the retrieved context. |
+| Answer relevancy | Whether the answer addresses the user's question. |
+| Contextual relevancy | Whether the retrieved context is relevant to the question. |
+
+Each metric uses the application's `gpt-4o-mini` judge and a passing threshold of **0.70**. Metrics execute in parallel. The reported overall score is the mean of metrics that returned a score; it passes when that mean is at least 0.70.
+
+## Repository layout
 
 ```text
-                    ┌──────────────────┐
-                    │   👤 User        │
-                    └────────┬─────────┘
-                             │
-                             ▼
-                    ┌──────────────────┐
-                    │ 📤 Upload File   │
-                    └────────┬─────────┘
-                             │
-                             ▼
-                    ┌──────────────────┐
-                    │ 📁 File Detection│
-                    └────────┬─────────┘
-                             │
-              ┌──────────────┼──────────────┐
-              ▼              ▼              ▼
-           📊 CSV       📄 PDF          🖼️ Image
-              │              │              │
-              │       ┌──────┴──────┐       │
-              │       ▼             ▼       │
-              │    Text PDF     Scanned PDF │
-              │       │             │       │
-              │       │          🔍 OCR      │
-              │       │             │       │
-              └───────┴──────┬──────┴───────┘
-                              ▼
-                       ✂️ Chunking
-                              │
-                              ▼
-                     🧬 Embeddings
-                              │
-                              ▼
-                      🗂️ FAISS Store
-                              │
-                              ▼
-                       🔎 MMR Retrieval
-                              │
-                              ▼
-                     🎯 Relevance Grader
-                              │
-                              ▼
-                  📚 Filter Relevant Chunks
-                              │
-                              ▼
-                  📊 Context Sufficiency
-                         │          │
-                    ❌ No│          │Yes
-                         ▼          ▼
-                   🔄 Retry    🤖 Generate
-                         │          │
-                         └─────┐    ▼
-                               │ 🧐 Critic
-                               │    │
-                               │ ┌──┴──┐
-                               │ ▼     ▼
-                               │PASS  FAIL
-                               │ │     │
-                               │ ▼     ▼
-                               │ Eval  Retry
-                               │ │
-                               ▼ ▼
-                         📈 Evaluation
-                              │
-                              ▼
-                         ✅ Answer
+omnirag-ai/
+├── app.py                     # Streamlit frontend
+├── api.py                     # FastAPI API, streaming, collections, security controls
+├── main.py                    # LangGraph RAG workflow, retrieval, critique, evaluation
+├── requirements.txt           # Frontend dependencies
+├── requirements-backend.txt   # API / RAG dependencies
+├── Dockerfile                 # Backend container
+├── Dockerfile.frontend        # Frontend container
+├── docker-compose.yml         # Two-service local deployment
+└── omnirag_logo.png           # UI branding asset
 ```
 
----
+## Run locally from GitHub
 
-# 🧩 Core Components
+### Prerequisites
 
-## 📂 1. Multi-Format Ingestion
+- [Git](https://git-scm.com/)
+- Python **3.12**
+- An [OpenAI API key](https://platform.openai.com/api-keys) with access to `gpt-4o-mini`
+- For Docker setup: Docker Desktop with Docker Compose
 
-OmniRAG accepts:
-
-```text
-📄 PDF
-📊 CSV
-🖼️ PNG
-🖼️ JPG
-🖼️ JPEG
-🖼️ BMP
-```
-
-The frontend explicitly configures these supported file types.
-
-The backend automatically routes files based on their extension.
-
----
-
-# 📄 2. Intelligent PDF Processing
-
-OmniRAG distinguishes between:
-
-### 📄 Text PDF
-
-Uses:
-
-```python
-PyPDFLoader
-```
-
-### 🖼️ Scanned PDF
-
-Uses:
-
-```text
-PDF
- ↓
-PDF → Images
- ↓
-PaddleOCR
- ↓
-Extracted Text
-```
-
-The system checks the extracted text from the first few pages to determine whether the PDF is text-based or scanned.
-
----
-
-# 🔍 3. OCR
-
-For scanned documents and images, OmniRAG uses **PaddleOCR**.
-
-```mermaid
-flowchart LR
-
-    A[📄 Scanned Document]
-    --> B[🖼️ Convert to Images]
-    --> C[🔍 PaddleOCR]
-    --> D[📝 Extract Text]
-    --> E[✂️ Chunking]
-    --> F[🧬 Embeddings]
-    --> G[(FAISS)]
-
-    style A fill:#EF4444,color:#fff
-    style C fill:#8B5CF6,color:#fff
-    style G fill:#2563EB,color:#fff
-```
-
-The OCR pipeline processes extracted text into LangChain `Document` objects for downstream RAG processing.
-
----
-
-# ✂️ 4. Intelligent Chunking
-
-OmniRAG uses:
-
-```python
-RecursiveCharacterTextSplitter
-```
-
-### Configuration
-
-| Parameter     | Value |
-| ------------- | ----: |
-| Chunk Size    | `800` |
-| Chunk Overlap | `150` |
-
-The splitter uses paragraph, line, sentence and whitespace separators.
-
----
-
-# 🧬 5. Embedding Model
-
-OmniRAG uses the Hugging Face embedding model:
-
-```text
-BAAI/bge-small-en-v1.5
-```
-
-The embeddings are generated from document chunks before storing them in the vector database.
-
----
-
-# ⚡ 6. FAISS Vector Database
-
-The project uses **FAISS** for vector storage and similarity retrieval.
-
-```text
-Documents
-    ↓
-Chunks
-    ↓
-Embeddings
-    ↓
-FAISS
-    ↓
-Relevant Documents
-```
-
----
-
-# 🎯 7. MMR Retrieval
-
-OmniRAG uses **Maximum Marginal Relevance (MMR)** retrieval.
-
-This allows the system to retrieve relevant information while reducing redundant chunks.
-
-The retrieval depth dynamically increases based on previous retrieval and critic attempts, up to a maximum of 20 documents.
-
----
-
-# 🧑‍⚖️ 8. Relevance Grading
-
-Retrieved documents are passed through an LLM-based relevance grader.
-
-```text
-Retrieved Document
-        │
-        ▼
-   🎯 Grader Agent
-        │
-    ┌───┴───┐
-    ▼       ▼
-   YES      NO
-    │       │
-    ▼       ▼
-  Keep    Remove
-```
-
-The grader returns `yes` or `no`, and only relevant chunks continue through the pipeline.
-
----
-
-# 📊 9. Context Sufficiency Agent
-
-Before generating an answer, OmniRAG checks whether the retrieved context contains enough information.
-
-It evaluates:
-
-* Completeness
-* Coverage
-* Missing information
-
-If the context is insufficient, retrieval is retried with an increased retrieval depth.
-
----
-
-# 🤖 10. Grounded Answer Generation
-
-The answer-generation agent is explicitly instructed to:
-
-```text
-✓ Use only retrieved context
-✓ Avoid unsupported facts
-✓ Avoid hallucination
-✓ Clearly state when information is insufficient
-✓ Produce concise answers
-```
-
----
-
-# 🧐 11. Critic Agent
-
-OmniRAG uses a separate critic stage to validate the generated answer.
-
-The critic checks:
-
-```text
-Question
-   +
-Context
-   +
-Generated Answer
-        │
-        ▼
-   🧐 Critic Agent
-        │
-   ┌────┴────┐
-   ▼         ▼
- PASS       FAIL
-   │         │
-   ▼         ▼
-Evaluation  Retry
-```
-
-The critic can identify:
-
-* `sufficient_context`
-* `insufficient_context`
-* `hallucination`
-* `irrelevant_answer`
-
----
-
-# 🔄 12. Self-Correction
-
-If the critic rejects an answer, OmniRAG can retry the pipeline.
-
-The system maintains separate counters for:
-
-```text
-retrieval_attempts
-critic_attempts
-```
-
-If the critic continues to fail after the configured retry limit, the system returns:
-
-```text
-❌ Answer not found in the uploaded documents.
-```
-
----
-
-# 📈 13. Evaluation
-
-OmniRAG evaluates the final response using four metrics:
-
-| Metric                   | What it measures                               |
-| ------------------------ | ---------------------------------------------- |
-| 🟢 **Faithfulness**      | Whether the answer is supported by context     |
-| 🔵 **Answer Relevancy**  | Whether the answer addresses the question      |
-| 🟣 **Context Precision** | Whether retrieved context is focused           |
-| 🟠 **Context Recall**    | Whether required information exists in context |
-
-Each score ranges from `0.0` to `1.0`.
-
----
-
-# 🎨 User Interface
-
-The Streamlit frontend provides:
-
-### 📤 Input
-
-* Document uploader
-* Question input
-* Ask button
-
-### 📊 Pipeline Statistics
-
-* Retrieval attempts
-* Critic attempts
-* Critic verdict
-* Critic reason
-
-### 💡 Output
-
-* Generated answer
-* Verification status
-* Evaluation metrics
-* Score visualization
-
-## The interface uses a custom dark theme with separate cards for answers, scores and pipeline statistics.
-
-# 🛠️ Tech Stack
-
-### 🧠 LLM & AI
-
-* OpenAI GPT-4o-mini
-* LangChain
-* LangGraph
-* Pydantic
-
-### 🔎 Retrieval
-
-* FAISS
-* Hugging Face Embeddings
-* BAAI/BGE
-* MMR Retrieval
-
-### 📄 Document Processing
-
-* PyPDF
-* PDFPlumber
-* CSVLoader
-* PaddleOCR
-* PDF2Image
-* PIL
-
-### 🎨 Frontend
-
-* Streamlit
-* HTML
-* CSS
-
-### 🐍 Development
-
-* Python
-* Git
-* GitHub
-
----
-
-# 📁 Project Structure
-
-```text
-OmniRAG/
-│
-├── frontend.py          # 🎨 Streamlit interface
-├── main.py              # 🧠 LangGraph RAG pipeline
-├── requirements.txt     # 📦 Dependencies
-├── .env                 # 🔐 API keys
-├── README.md            # 📖 Documentation
-│
-└── assets/              # 🖼️ Optional assets
-```
-
-The frontend imports the compiled LangGraph workflow from `main.py`.
-
----
-
-# ⚙️ Installation
-
-## 1. Clone the repository
+### 1. Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/OmniRAG.git
-
-cd OmniRAG
+git clone https://github.com/<your-github-username>/omnirag-ai.git
+cd omnirag-ai
 ```
 
-## 2. Create a virtual environment
+Replace `<your-github-username>` with the account or organization that owns the repository.
 
-### Windows
+### 2. Create `.env`
 
-```bash
-python -m venv venv
-venv\Scripts\activate
+Create a file named `.env` in the repository root. Never commit it.
+
+```dotenv
+OPENAI_API_KEY=your_openai_api_key_here
+OMNIRAG_API_KEY=choose_a_long_random_local_secret
+
+# Optional configuration
+OMNIRAG_API_URL=http://127.0.0.1:8000
+OMNIRAG_CORS_ORIGINS=http://localhost:8501,http://127.0.0.1:8501
+OMNIRAG_DATA_DIR=.
 ```
 
-### macOS / Linux
+`OMNIRAG_API_KEY` protects the data-bearing API endpoints. The Streamlit application sends it as the `X-API-Key` header.
+
+### Option A — Docker Compose (recommended)
+
+Docker handles the Python dependencies and stores indexes in the named `omnirag_data` volume.
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+docker compose up --build
 ```
 
-## 3. Install dependencies
+Open:
+
+- Frontend: <http://localhost:8501>
+- Interactive API documentation: <http://localhost:8000/docs>
+- Health check: <http://localhost:8000/health>
+
+Stop the application with `Ctrl+C`; to run it in the background, use:
 
 ```bash
+docker compose up --build -d
+```
+
+### Option B — Run with Python
+
+Create and activate a virtual environment:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate       # macOS / Linux
+# .venv\Scripts\Activate.ps1   # Windows PowerShell
+python -m pip install --upgrade pip
+```
+
+Install both dependency groups:
+
+```bash
+pip install -r requirements-backend.txt
 pip install -r requirements.txt
 ```
 
----
-
-# 🔐 Environment Variables
-
-Create a `.env` file:
-
-```env
-OPENAI_API_KEY=your_openai_api_key
-```
-
-The application loads environment variables using `python-dotenv` and initializes GPT-4o-mini with temperature `0`.
-
----
-
-# ▶️ Run OmniRAG
+Start the API in the first terminal:
 
 ```bash
-streamlit run frontend.py
+uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
-Then open the Streamlit URL shown in your terminal.
+Start the frontend in a second terminal (activate the same virtual environment first):
 
----
-
-# 🧪 Example
-
-### Upload
-
-```text
-📄 research_paper.pdf
+```bash
+streamlit run app.py
 ```
 
-### Ask
+Then visit <http://localhost:8501>. The first start can take longer because Docling and Hugging Face models may need to download.
 
-```text
-"What are the main conclusions of this research paper?"
-```
+## Use the application
 
-### OmniRAG
+1. Open the Streamlit interface.
+2. Select an existing collection or create a new one.
+3. Upload one or more supported documents. Subsequent uploads append to the collection; duplicate content is ignored.
+4. Ask a question about the documents.
+5. Watch live pipeline steps and streamed output.
+6. Open **Sources** to inspect cited context and provenance.
+7. Select **Evaluate answer** to run the three DeepEval checks.
 
-```text
-📄 Load
-   ↓
-✂️ Chunk
-   ↓
-🧬 Embed
-   ↓
-🗂️ FAISS
-   ↓
-🔎 Retrieve
-   ↓
-🎯 Grade
-   ↓
-📊 Check Sufficiency
-   ↓
-🤖 Generate
-   ↓
-🧐 Critic
-   ↓
-📈 Evaluate
-   ↓
-✅ Answer
-```
+## API overview
 
----
+All data-bearing routes require `X-API-Key: <OMNIRAG_API_KEY>`.
 
-# 🧠 Traditional RAG vs OmniRAG
+| Route | Purpose |
+| --- | --- |
+| `GET /health` | Service health and configured retrieval provider summary. |
+| `GET /supported-formats` | Supported backend file extensions. |
+| `GET /collections` | List persisted collections. |
+| `POST /collections` | Create a collection. |
+| `POST /query` | Ingest optional uploads and return a complete RAG answer. |
+| `POST /query/stream` | Same RAG flow as NDJSON events and generated tokens. |
+| `POST /evaluate` | Evaluate an answer against its retrieval context. |
+| `POST /evaluate/stream` | Stream evaluation metrics as they finish. |
 
-| Traditional RAG | 🚀 OmniRAG           |
-| --------------- | -------------------- |
-| Retrieve        | Retrieve             |
-| Generate        | Grade                |
-| Answer          | Check context        |
-| —               | Generate             |
-| —               | Critic               |
-| —               | Retry                |
-| —               | Evaluate             |
-| —               | Verified / Not Found |
+The API includes CORS controls, a simple per-client in-process rate limiter, upload limits (25 MB per file, 100 MB total, 20 files by default), filename sanitization, and temporary-upload cleanup.
 
-### OmniRAG focuses on:
+## Configuration
 
-**Retrieval Quality → Context Quality → Answer Quality → Answer Verification**
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | — | Required OpenAI credential. |
+| `OMNIRAG_API_KEY` | — | Required shared secret for protected API routes. |
+| `OMNIRAG_API_URL` | `http://127.0.0.1:8000` | Frontend URL for the API. Docker overrides it to `http://api:8000`. |
+| `OMNIRAG_DATA_DIR` | repository directory | Location for persistent indexes and collection manifests. |
+| `OMNIRAG_RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Hugging Face cross-encoder used for reranking. |
+| `OMNIRAG_VECTOR_CANDIDATES` | `30` | Dense candidate retrieval pool. |
+| `OMNIRAG_LEXICAL_CANDIDATES` | `30` | BM25 candidate retrieval pool. |
+| `OMNIRAG_RRF_K` | `60` | RRF fusion constant. |
+| `OMNIRAG_RERANK_TOP_N` | `8` | Chunks retained after reranking. |
+| `OMNIRAG_MEMORY_INDEXES` | `8` | Maximum number of in-memory FAISS indexes. |
+| `OMNIRAG_MAX_UPLOAD_FILE_BYTES` | `25 MB` | Maximum size for one file. |
+| `OMNIRAG_MAX_UPLOAD_TOTAL_BYTES` | `100 MB` | Maximum aggregate upload size per request. |
+| `OMNIRAG_MAX_FILES_PER_REQUEST` | `20` | Maximum file count per request. |
+| `OMNIRAG_RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window duration. |
+| `OMNIRAG_RATE_LIMIT_MAX_REQUESTS` | `20` | Maximum protected requests per client in the window. |
+| `OMNIRAG_CORS_ORIGINS` | local Streamlit URLs | Comma-separated CORS allowlist. |
 
----
+## Notes for contributors
 
-# 🔮 Future Improvements
-
-* [ ] Persistent FAISS indexes
-* [ ] Multi-document knowledge bases
-* [ ] Conversation memory
-* [ ] Source citations
-* [ ] Streaming responses
-* [ ] LangSmith observability
-* [ ] Docker deployment
-* [ ] Cloud deployment
-* [ ] Authentication
-* [ ] User-specific document collections
-* [ ] Improved OCR preprocessing
-* [ ] Configurable retrieval parameters
-* [ ] Native RAGAS metric integration
-
----
-
-# 👨‍💻 Author
-
-## Hrishav Raj
-
-**B.Tech | AI / ML & Generative AI Enthusiast**
-
-### Interests
-
-`AI` · `Machine Learning` · `Generative AI` · `LLMs` · `RAG` · `Agentic AI` · `LangChain` · `LangGraph`
-
----
-
-<div align="center">
-
-## ⭐ OmniRAG
-
-### **Retrieve intelligently. Critique rigorously. Answer reliably.**
-
-Built with ❤️ using **Python · LangChain · LangGraph · FAISS · OpenAI · Streamlit**
-
-</div>
+- Keep credentials in `.env`; it is already ignored by Git.
+- Do not commit `vectorstore_cache/`, `knowledge_base_collections/`, or `.deepeval/`; they are local generated data.
+- When changing graph behavior, update the Mermaid diagram and the retry/safety descriptions above so the documentation remains accurate.
